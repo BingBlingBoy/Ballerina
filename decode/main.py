@@ -1,195 +1,248 @@
-
-import pybullet as p
-import pybullet_data
+import cv2
+import cv2.aruco as aruco
 import numpy as np
 import joblib
-import time
 
-# Load trained classifier
+# =====================================
+# CONFIG
+# =====================================
+
+MARKER_IDS = {
+    "head": 0,
+    "left_shoulder": 1,
+    "right_shoulder": 2,
+    "left_hand": 3,
+    "right_hand": 4
+}
+
+MARKER_SIZE = 0.04
+
+# =====================================
+# DEFAULT CAMERA MODEL
+# =====================================
+
+CAMERA_MATRIX = np.array([
+    [1000.0, 0.0, 640.0],
+    [0.0, 1000.0, 360.0],
+    [0.0, 0.0, 1.0]
+], dtype=np.float32)
+
+DIST_COEFFS = np.zeros((5, 1))
+
+# =====================================
+# LOAD MODEL
+# =====================================
+
 model = joblib.load(
     "models/letter_classifier.joblib"
 )
 
-# Start simulation
-physics = p.connect(p.GUI)
+print("Model loaded")
 
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
-p.setGravity(0, 0, 0)
+# =====================================
+# ARUCO
+# =====================================
 
-p.loadURDF("plane.urdf")
-
-# Camera
-p.resetDebugVisualizerCamera(
-    cameraDistance=2.5,
-    cameraYaw=45,
-    cameraPitch=-25,
-    cameraTargetPosition=[0.5, 0, 0.2]
+dictionary = aruco.getPredefinedDictionary(
+    aruco.DICT_4X4_50
 )
 
-# Load robot
-robot = p.loadURDF(
-    "robot/robot.urdf",
-    useFixedBase=True
-)
+if hasattr(aruco, "ArucoDetector"):
 
-# Find movable joints
-joint_indices = []
+    detector = aruco.ArucoDetector(
+        dictionary,
+        aruco.DetectorParameters()
+    )
 
-for i in range(p.getNumJoints(robot)):
-    info = p.getJointInfo(robot, i)
+    def detect(gray):
+        return detector.detectMarkers(gray)
 
-    if info[2] in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC):
-        joint_indices.append(i)
+else:
 
-print("Robot loaded!")
-print("Movable joints:", joint_indices)
+    parameters = aruco.DetectorParameters_create()
 
-# Joint configuration
-current_pose = np.zeros(3)
-
-# Joint limits from URDF
-lower_limits = np.array([-2.8, -2.8, -2.8])
-upper_limits = np.array([2.8, 2.8, 2.8])
-
-STEP = 0.05
-
-# Example poses
-POSES = {
-    ord("1"): np.array([0.0, 0.0, 0.0]),
-    ord("2"): np.array([1.0, -0.8, 0.6]),
-    ord("3"): np.array([-1.0, 0.8, -0.6])
-}
-
-# Keyboard joint controls
-JOINT_KEYS = {
-    ord("q"): (0, STEP),
-    ord("a"): (0, -STEP),
-
-    ord("w"): (1, STEP),
-    ord("s"): (1, -STEP),
-
-    ord("e"): (2, STEP),
-    ord("d"): (2, -STEP)
-}
-
-print("""
-CONTROLS
-----------------------
-1 = Pose A
-2 = Pose B
-3 = Pose C
-
-Q/A = Joint 1 +/- 
-W/S = Joint 2 +/-
-E/D = Joint 3 +/-
-
-R = Reset
-ESC = Quit
-----------------------
-""")
-
-def update_robot():
-    global current_pose
-
-    for index, angle in zip(joint_indices, current_pose):
-        p.resetJointState(
-            robot,
-            index,
-            float(angle)
+    def detect(gray):
+        return aruco.detectMarkers(
+            gray,
+            dictionary,
+            parameters=parameters
         )
 
-def get_skeleton():
-    skeleton = []
+# =====================================
+# POSE ESTIMATION
+# =====================================
 
-    # Base position
-    base = p.getBasePositionAndOrientation(robot)[0]
-    skeleton.append(base)
+def estimate_marker_poses(corners, ids):
 
-    # Link positions
-    for link_index in range(4):
-        state = p.getLinkState(
-            robot,
-            link_index,
-            computeForwardKinematics=True
+    poses = {}
+
+    if ids is None:
+        return poses
+
+    h = MARKER_SIZE / 2
+
+    object_points = np.array([
+        [-h, h, 0],
+        [h, h, 0],
+        [h, -h, 0],
+        [-h, -h, 0]
+    ], dtype=np.float32)
+
+    for corner, marker_id in zip(
+        corners,
+        ids.flatten()
+    ):
+
+        success, rvec, tvec = cv2.solvePnP(
+            object_points,
+            corner.reshape(4, 2).astype(np.float32),
+            CAMERA_MATRIX,
+            DIST_COEFFS,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE
         )
 
-        skeleton.append(state[4])
+        if success:
 
-    return np.asarray(skeleton)
+            R, _ = cv2.Rodrigues(rvec)
 
-last_prediction_time = 0
+            poses[int(marker_id)] = (
+                R,
+                tvec.reshape(3)
+            )
+
+    return poses
+
+# =====================================
+# FEATURES
+# =====================================
+
+def extract_features(poses):
+
+    reference_id = MARKER_IDS["head"]
+
+    if reference_id not in poses:
+        return None
+
+    R_ref, t_ref = poses[reference_id]
+
+    features = []
+
+    for marker_id in MARKER_IDS.values():
+
+        if marker_id not in poses:
+            return None
+
+        R, t = poses[marker_id]
+
+        R_relative = R_ref.T @ R
+
+        t_relative = R_ref.T @ (
+            t - t_ref
+        )
+
+        rvec, _ = cv2.Rodrigues(
+            R_relative
+        )
+
+        features.extend(
+            t_relative.tolist()
+        )
+
+        features.extend(
+            rvec.flatten().tolist()
+        )
+
+    return np.array(
+        features,
+        dtype=np.float32
+    )
+
+# =====================================
+# LIVE INFERENCE
+# =====================================
+
+cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    raise RuntimeError(
+        "Could not open webcam"
+    )
 
 while True:
 
-    keys = p.getKeyboardEvents()
+    ret, frame = cap.read()
 
-    for key, state in keys.items():
+    if not ret:
+        break
 
-        if not (state & p.KEY_WAS_TRIGGERED):
-            continue
-
-        # Preset poses
-        if key in POSES:
-            current_pose = POSES[key].copy()
-
-        # Individual joint control
-        elif key in JOINT_KEYS:
-            joint, change = JOINT_KEYS[key]
-            current_pose[joint] += change
-
-        # Reset
-        elif key == ord("r"):
-            current_pose = np.zeros(3)
-
-        # Quit
-        elif key == 27:
-            p.disconnect()
-            raise SystemExit
-
-    # Enforce joint limits
-    current_pose = np.clip(
-        current_pose,
-        lower_limits,
-        upper_limits
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
     )
 
-    # Apply joint positions
-    update_robot()
+    corners, ids, _ = detect(gray)
 
-    p.stepSimulation()
-
-    # Extract actual joint angles
-    joint_angles = []
-
-    for index in joint_indices:
-        state = p.getJointState(robot, index)
-        joint_angles.append(state[0])
-
-    # Reconstruct skeleton
-    skeleton = get_skeleton()
-
-    # Classification
-    prediction = model.predict([joint_angles])[0]
-
-    probabilities = model.predict_proba([joint_angles])[0]
-
-    confidence = np.max(probabilities)
-
-    # Print status
-    print(
-        "\rAngles:",
-        np.round(joint_angles, 2),
-        "| Prediction:",
-        prediction,
-        "| Confidence:",
-        round(confidence, 3),
-        end="          "
+    poses = estimate_marker_poses(
+        corners,
+        ids
     )
 
-    # Print skeleton occasionally
-    if time.time() - last_prediction_time > 2:
-        print("\nSkeleton coordinates:")
-        print(np.round(skeleton, 3))
-        last_prediction_time = time.time()
+    if ids is not None:
 
-    time.sleep(1 / 30)
+        aruco.drawDetectedMarkers(
+            frame,
+            corners,
+            ids
+        )
+
+    features = extract_features(
+        poses
+    )
+
+    prediction_text = "Missing markers"
+
+    colour = (0, 0, 255)
+
+    if features is not None:
+
+        sample = features.reshape(1, -1)
+
+        prediction = model.predict(
+            sample
+        )[0]
+
+        confidence = max(
+            model.predict_proba(
+                sample
+            )[0]
+        )
+
+        prediction_text = (
+            f"{prediction} "
+            f"({confidence:.1%})"
+        )
+
+        colour = (0, 255, 0)
+
+    cv2.putText(
+        frame,
+        prediction_text,
+        (20, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        colour,
+        3
+    )
+
+    cv2.imshow(
+        "Letter Classifier",
+        frame
+    )
+
+    key = cv2.waitKey(1)
+
+    if key == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

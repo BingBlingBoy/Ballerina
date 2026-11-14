@@ -1,43 +1,206 @@
+# import os
+# import joblib
+# import pandas as pd
 
-import numpy as np
+# from sklearn.svm import SVC
+# from sklearn.pipeline import make_pipeline
+# from sklearn.preprocessing import StandardScaler
+# from sklearn.model_selection import train_test_split
+# from sklearn.metrics import (
+#     classification_report,
+#     confusion_matrix,
+#     accuracy_score,
+# )
+
+# # =====================================
+# # LOAD DATASET
+# # =====================================
+
+
+# DATASET_FILE = "./robot_vision/collect_robot_data.py"
+
+# df = pd.read_csv(DATASET_FILE)
+
+# print(f"Loaded {len(df)} samples")
+
+# # =====================================
+# # SPLIT FEATURES / LABELS
+# # =====================================
+
+# X = df.drop(columns=["label"])
+# y = df["label"]
+
+# print("Feature shape:", X.shape)
+# print("Classes:", sorted(y.unique()))
+
+# # =====================================
+# # TRAIN / TEST SPLIT
+# # =====================================
+
+# X_train, X_test, y_train, y_test = train_test_split(
+#     X,
+#     y,
+#     test_size=0.2,
+#     random_state=42,
+#     stratify=y
+# )
+
+# # =====================================
+# # CREATE MODEL
+# # =====================================
+
+# model = make_pipeline(
+#     StandardScaler(),
+#     SVC(
+#         kernel="rbf",
+#         C=10,
+#         gamma="scale",
+#         probability=True
+#     )
+# )
+
+# # =====================================
+# # TRAIN
+# # =====================================
+
+# print("Training...")
+
+# model.fit(
+#     X_train,
+#     y_train
+# )
+
+# print("Training complete")
+
+# # =====================================
+# # EVALUATE
+# # =====================================
+
+# y_pred = model.predict(X_test)
+
+# accuracy = accuracy_score(
+#     y_test,
+#     y_pred
+# )
+
+# print()
+# print("Accuracy:")
+# print(f"{accuracy:.4f}")
+
+# print()
+# print("Classification Report:")
+# print(
+#     classification_report(
+#         y_test,
+#         y_pred
+#     )
+# )
+
+# print()
+# print("Confusion Matrix:")
+# print(
+#     confusion_matrix(
+#         y_test,
+#         y_pred
+#     )
+# )
+
+# # =====================================
+# # SAVE MODEL
+# # =====================================
+
+# os.makedirs(
+#     "models",
+#     exist_ok=True
+# )
+
+# joblib.dump(
+#     model,
+#     "models/letter_classifier.joblib"
+# )
+
+# print()
+# print(
+#     "Model saved to:"
+# )
+# print(
+#     "models/letter_classifier.joblib"
+# )
+
+# # =====================================
+# # QUICK TEST
+# # =====================================
+
+# sample = X.iloc[[0]]
+
+# prediction = model.predict(
+#     sample
+# )
+
+# probabilities = model.predict_proba(
+#     sample
+# )
+
+# confidence = probabilities.max()
+
+# print()
+# print(
+#     f"Example prediction: "
+#     f"{prediction[0]}"
+# )
+
+# print(
+#     f"Confidence: "
+#     f"{confidence:.2%}"
+# )
+
+import os
 import joblib
+import pandas as pd
 
 from sklearn.svm import SVC
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score
 
-# Example robot configurations.
-# Values are joint angles in radians.
+# =====================================
+# LOAD DATA
+# =====================================
 
-POSES = {
-    "A": [0.0, 0.0, 0.0],
-    "B": [1.0, -0.8, 0.6],
-    "C": [-1.0, 0.8, -0.6],
-}
+df = pd.read_csv("./robot_vision/robot_pose_dataset.csv")
 
-X = []
-y = []
+# Keep only A and B
 
-# Generate example training data
-rng = np.random.default_rng(42)
+df = df[df["label"].isin(["A", "B"])]
 
-for letter, pose in POSES.items():
+print("Samples:", len(df))
+print("Classes:", df["label"].unique())
 
-    pose = np.array(pose)
+# =====================================
+# FEATURES / LABELS
+# =====================================
 
-    for _ in range(400):
+X = df.drop(columns=["label"])
+y = df["label"]
 
-        noise = rng.normal(0, 0.1, 3)
+# =====================================
+# TRAIN / TEST SPLIT
+# =====================================
 
-        sample = pose + noise
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
 
-        X.append(sample)
-        y.append(letter)
+# =====================================
+# MODEL
+# =====================================
 
-X = np.array(X)
-y = np.array(y)
-
-# Create classifier
 model = make_pipeline(
     StandardScaler(),
     SVC(
@@ -48,17 +211,80 @@ model = make_pipeline(
     )
 )
 
-# Train
-model.fit(X, y)
+# =====================================
+# TRAIN
+# =====================================
 
-# Save model
-joblib.dump(model, "models/letter_classifier.joblib")
+print("Training...")
 
-print("Classifier trained successfully!")
+model.fit(
+    X_train,
+    y_train
+)
 
-# Test
-test_pose = [[0.05, -0.02, 0.01]]
+print("Training complete")
 
-prediction = model.predict(test_pose)
+# =====================================
+# EVALUATE
+# =====================================
 
-print("Predicted letter:", prediction[0])
+y_pred = model.predict(X_test)
+
+accuracy = accuracy_score(
+    y_test,
+    y_pred
+)
+
+print(f"\nAccuracy: {accuracy:.4f}")
+
+print(
+    "\nClassification Report:\n"
+)
+
+print(
+    classification_report(
+        y_test,
+        y_pred
+    )
+)
+
+# =====================================
+# SAVE
+# =====================================
+
+os.makedirs(
+    "models",
+    exist_ok=True
+)
+
+joblib.dump(
+    model,
+    "models/letter_classifier.joblib"
+)
+
+print(
+    "\nSaved model to "
+    "models/letter_classifier.joblib"
+)
+
+# =====================================
+# TEST ON FIRST SAMPLE
+# =====================================
+
+sample = X.iloc[[0]]
+
+prediction = model.predict(sample)[0]
+
+confidence = max(
+    model.predict_proba(sample)[0]
+)
+
+print(
+    f"\nPrediction: "
+    f"{prediction}"
+)
+
+print(
+    f"Confidence: "
+    f"{confidence:.2%}"
+)
