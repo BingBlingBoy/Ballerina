@@ -3,3 +3,6 @@ yolov8n-pose.pt
 runs
 labels.cache
 models
+robot_vision/camera_calibration.npz
+__pycache__/
+*.py[cod]

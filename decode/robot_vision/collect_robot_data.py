@@ -1,359 +1,217 @@
-import cv2
-import cv2.aruco as aruco
-import numpy as np
 import csv
-import os
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
-MARKER_IDS = {
-    "head": 0,
-    "left_shoulder": 1,
-    "right_shoulder": 2,
-    "left_hand": 3,
-    "right_hand": 4
-}
+import cv2
+import numpy as np
 
-MARKER_SIZE = 0.04
-CSV_FILE = "robot_pose_dataset.csv"
-BURST_SAMPLES = 100
-
-
-# Camera Configuration
-CAMERA_MATRIX = np.array([
-    [1000.0,    0.0, 640.0],
-    [   0.0, 1000.0, 360.0],
-    [   0.0,    0.0,   1.0]
-], dtype=np.float32)
-
-DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
-
-# Creation of dataset file
-if not os.path.exists(CSV_FILE):
-
-    with open(CSV_FILE, "w", newline="") as f:
-
-        writer = csv.writer(f)
-
-        header = ["label"]
-
-        for i in range(30):
-            header.append(f"feature_{i}")
-
-        writer.writerow(header)
-
-
-# Aruco stuff
-dictionary = aruco.getPredefinedDictionary(
-    aruco.DICT_4X4_50
-)
-
-if hasattr(aruco, "ArucoDetector"):
-
-    detector = aruco.ArucoDetector(
-        dictionary,
-        aruco.DetectorParameters()
+if __package__:
+    from .robot_pose_features import (
+        CALIBRATION_FILE,
+        LETTER_DATASET_COLUMNS,
+        LETTER_LABELS,
+        camera_matrix_for_frame,
+        detect_markers,
+        estimate_marker_poses,
+        extract_pose_features,
+        load_camera_calibration,
     )
-
-    def detect(gray):
-        return detector.detectMarkers(gray)
-
 else:
-
-    parameters = aruco.DetectorParameters_create()
-
-    def detect(gray):
-        return aruco.detectMarkers(
-            gray,
-            dictionary,
-            parameters=parameters
-        )
-
-def save_sample(label, features):
-
-    with open(CSV_FILE, "a", newline="") as f:
-
-        writer = csv.writer(f)
-
-        row = [label]
-        row.extend(features.tolist())
-
-        writer.writerow(row)
-
-def estimate_marker_poses(corners, ids):
-
-    poses = {}
-
-    if ids is None:
-        return poses
-
-    h = MARKER_SIZE / 2
-
-    object_points = np.array([
-        [-h,  h, 0],
-        [ h,  h, 0],
-        [ h, -h, 0],
-        [-h, -h, 0]
-    ], dtype=np.float32)
-
-    for corner, marker_id in zip(
-        corners,
-        ids.flatten()
-    ):
-
-        success, rvec, tvec = cv2.solvePnP(
-            object_points,
-            corner.reshape(4, 2).astype(np.float32),
-            CAMERA_MATRIX,
-            DIST_COEFFS,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
-        )
-
-        if success:
-
-            R, _ = cv2.Rodrigues(rvec)
-
-            poses[int(marker_id)] = (
-                R,
-                tvec.reshape(3)
-            )
-
-    return poses
-
-def extract_features(poses):
-
-    reference_id = MARKER_IDS["head"]
-
-    if reference_id not in poses:
-        return None
-
-    R_ref, t_ref = poses[reference_id]
-
-    features = []
-
-    for marker_id in MARKER_IDS.values():
-
-        if marker_id not in poses:
-            return None
-
-        R, t = poses[marker_id]
-
-        R_relative = R_ref.T @ R
-
-        t_relative = R_ref.T @ (
-            t - t_ref
-        )
-
-        rvec, _ = cv2.Rodrigues(
-            R_relative
-        )
-
-        features.extend(
-            t_relative.tolist()
-        )
-
-        features.extend(
-            rvec.flatten().tolist()
-        )
-
-    return np.array(
-        features,
-        dtype=np.float32
+    from robot_pose_features import (
+        CALIBRATION_FILE,
+        LETTER_DATASET_COLUMNS,
+        LETTER_LABELS,
+        camera_matrix_for_frame,
+        detect_markers,
+        estimate_marker_poses,
+        extract_pose_features,
+        load_camera_calibration,
     )
 
-def record_burst(cap, label):
 
-    print(
-        f"\nRecording {BURST_SAMPLES} "
-        f"samples for '{label}'"
-    )
+SCRIPT_DIR = Path(__file__).resolve().parent
+CSV_FILE = SCRIPT_DIR / "robot_pose_letter_dataset.csv"
+CAMERA_INDEX = 0
+BURST_SAMPLES = 20
+SAMPLE_INTERVAL_SECONDS = 0.1
+BURST_TIMEOUT_SECONDS = 15.0
 
-    saved = 0
 
-    while saved < BURST_SAMPLES:
+def label_from_key(key):
+    if ord("A") <= key <= ord("Z"):
+        key += ord("a") - ord("A")
+    if ord("a") <= key <= ord("z"):
+        label = chr(key).upper()
+        return label if label in LETTER_LABELS else None
+    return None
 
-        ret, frame = cap.read()
 
-        if not ret:
-            continue
+def ensure_dataset():
+    if not CSV_FILE.exists():
+        with CSV_FILE.open("w", newline="", encoding="utf-8") as dataset:
+            csv.writer(dataset).writerow(LETTER_DATASET_COLUMNS)
+        return
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        corners, ids, _ = detect(gray)
-
-        poses = estimate_marker_poses(
-            corners,
-            ids
-        )
-
-        features = extract_features(
-            poses
-        )
-
-        if features is not None:
-
-            save_sample(
-                label,
-                features
-            )
-
-            saved += 1
-
-        display = frame.copy()
-
-        if ids is not None:
-
-            aruco.drawDetectedMarkers(
-                display,
-                corners,
-                ids
-            )
-
-        cv2.putText(
-            display,
-            f"Recording {label}: "
-            f"{saved}/{BURST_SAMPLES}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2
-        )
-
-        cv2.imshow(
-            "Robot Dataset Recorder",
-            display
-        )
-
-        cv2.waitKey(1)
-
-    print(
-        f"Finished recording "
-        f"{saved} samples for {label}"
-    )
-
-# loop
-def process_camera():
-
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
+    with CSV_FILE.open("r", newline="", encoding="utf-8") as dataset:
+        header = next(csv.reader(dataset), None)
+    if tuple(header or ()) != LETTER_DATASET_COLUMNS:
         raise RuntimeError(
-            "Could not open camera"
+            f"{CSV_FILE} has an incompatible legacy schema. Move it aside or "
+            "start a new dataset before recording; existing rows were not changed."
         )
 
-    print()
-    print("==============================")
-    print("ROBOT DATASET COLLECTION")
-    print("==============================")
-    print()
-    print("Markers required:")
-    print("0 = head")
-    print("1 = left shoulder")
-    print("2 = right shoulder")
-    print("3 = left hand")
-    print("4 = right hand")
-    print()
-    print("Press A-Z to record")
-    print(
-        f"{BURST_SAMPLES} samples "
-        "will be captured"
+
+def write_sample(writer, session_id, capture_id, label, features):
+    writer.writerow(
+        [
+            session_id,
+            capture_id,
+            datetime.now(timezone.utc).isoformat(),
+            label,
+            *[float(value) for value in features],
+        ]
     )
-    print("Press q to quit")
-    print()
 
-    while True:
 
-        ret, frame = cap.read()
+def record_burst(capture, calibration, session_id, label):
+    capture_id = uuid.uuid4().hex
+    saved = 0
+    deadline = time.monotonic() + BURST_TIMEOUT_SECONDS
+    next_sample_at = time.monotonic()
+    consecutive_read_failures = 0
 
-        if not ret:
-            break
+    with CSV_FILE.open("a", newline="", encoding="utf-8") as dataset:
+        writer = csv.writer(dataset)
+        while saved < BURST_SAMPLES and time.monotonic() < deadline:
+            success, frame = capture.read()
+            if not success:
+                consecutive_read_failures += 1
+                if consecutive_read_failures >= 10:
+                    raise RuntimeError("Camera repeatedly failed to provide frames.")
+                continue
+            consecutive_read_failures = 0
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        corners, ids, _ = detect(gray)
-
-        poses = estimate_marker_poses(
-            corners,
-            ids
-        )
-
-        features = extract_features(
-            poses
-        )
-
-        if ids is not None:
-
-            aruco.drawDetectedMarkers(
-                frame,
+            camera_matrix, distortion = camera_matrix_for_frame(calibration, frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = detect_markers(gray)
+            poses = estimate_marker_poses(
                 corners,
-                ids
+                ids,
+                camera_matrix,
+                distortion,
             )
+            features = extract_pose_features(poses)
 
-        ready = (
-            features is not None
+            display = frame.copy()
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(display, corners, ids)
+            status = (
+                f"Pose {label}: {saved}/{BURST_SAMPLES}"
+                if features is not None
+                else "Waiting for all six markers with valid poses"
+            )
+            cv2.putText(
+                display,
+                status,
+                (15, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(display, "Esc: quit", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.imshow("Robot Motion Data Recorder", display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                return False
+
+            now = time.monotonic()
+            if features is not None and now >= next_sample_at:
+                write_sample(writer, session_id, capture_id, label, features)
+                saved += 1
+                next_sample_at = now + SAMPLE_INTERVAL_SECONDS
+
+    if saved != BURST_SAMPLES:
+        print(
+            f"Only captured {saved}/{BURST_SAMPLES} samples for pose {label}; "
+            "the partial burst is retained and can be completed in another capture."
         )
+    else:
+        print(f"Saved {saved} samples for pose {label} (capture {capture_id[:8]}).")
+    return True
 
-        cv2.putText(
-            frame,
-            "READY"
-            if ready
-            else "SHOW ALL 5 MARKERS",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0)
-            if ready
-            else (0, 0, 255),
-            2
-        )
 
-        cv2.putText(
-            frame,
-            "Press A-Z to record",
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 0),
-            2
-        )
+def process_camera():
+    ensure_dataset()
+    calibration = load_camera_calibration(CALIBRATION_FILE)
+    capture = cv2.VideoCapture(CAMERA_INDEX)
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open camera {CAMERA_INDEX}.")
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        cv2.imshow(
-            "Robot Dataset Recorder",
-            frame
-        )
+    session_id = uuid.uuid4().hex
+    consecutive_read_failures = 0
+    print("Hold a complete, settled whole-body pose and press its letter A-Z.")
+    print("The letter labels the pose; Q records the Q pose like any other letter.")
+    print("Each capture records 20 valid samples at about 10 Hz. Press Esc to quit.")
 
-        key = cv2.waitKey(1) & 0xFF
+    try:
+        while True:
+            success, frame = capture.read()
+            if not success:
+                consecutive_read_failures += 1
+                if consecutive_read_failures >= 10:
+                    raise RuntimeError("Camera repeatedly failed to provide frames.")
+                continue
+            consecutive_read_failures = 0
 
-        if key == ord("q"):
-            break
+            camera_matrix, distortion = camera_matrix_for_frame(calibration, frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = detect_markers(gray)
+            poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
+            features = extract_pose_features(poses)
 
-        if ready:
+            display = frame.copy()
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(display, corners, ids)
+            cv2.putText(
+                display,
+                "Ready to record" if features is not None else "Show all markers 0-5",
+                (15, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0) if features is not None else (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                display,
+                "Move to a pose, let it settle, press A-Z to label; Esc quits",
+                (15, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+            cv2.imshow("Robot Motion Data Recorder", display)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                break
+            label = label_from_key(key)
+            if label is not None:
+                if not record_burst(
+                    capture,
+                    calibration,
+                    session_id,
+                    label,
+                ):
+                    break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
 
-            if ord("A") <= key <= ord("Z"):
-
-                record_burst(
-                    cap,
-                    chr(key)
-                )
-
-            elif ord("a") <= key <= ord("z"):
-
-                record_burst(
-                    cap,
-                    chr(key).upper()
-                )
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-# ==================================================
-# ENTRY POINT
-# ==================================================
 
 if __name__ == "__main__":
     process_camera()

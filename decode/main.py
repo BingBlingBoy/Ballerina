@@ -1,248 +1,156 @@
+from collections import deque
+from pathlib import Path
+
 import cv2
-import cv2.aruco as aruco
-import numpy as np
 import joblib
+import numpy as np
 
-# =====================================
-# CONFIG
-# =====================================
-
-MARKER_IDS = {
-    "head": 0,
-    "left_shoulder": 1,
-    "right_shoulder": 2,
-    "left_hand": 3,
-    "right_hand": 4
-}
-
-MARKER_SIZE = 0.04
-
-# =====================================
-# DEFAULT CAMERA MODEL
-# =====================================
-
-CAMERA_MATRIX = np.array([
-    [1000.0, 0.0, 640.0],
-    [0.0, 1000.0, 360.0],
-    [0.0, 0.0, 1.0]
-], dtype=np.float32)
-
-DIST_COEFFS = np.zeros((5, 1))
-
-# =====================================
-# LOAD MODEL
-# =====================================
-
-model = joblib.load(
-    "models/letter_classifier.joblib"
+from robot_vision.robot_pose_features import (
+    CALIBRATION_FILE,
+    LETTER_LABELS,
+    MODEL_SCHEMA_VERSION,
+    camera_matrix_for_frame,
+    detect_markers,
+    estimate_marker_poses,
+    extract_pose_features,
+    load_camera_calibration,
 )
 
-print("Model loaded")
 
-# =====================================
-# ARUCO
-# =====================================
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_FILE = SCRIPT_DIR / "models" / "pose_letter_classifier.joblib"
+CAMERA_INDEX = 0
+MIN_CONFIDENCE = 0.60
+SMOOTHING_WINDOW = 5
+MIN_STABLE_VOTES = 3
 
-dictionary = aruco.getPredefinedDictionary(
-    aruco.DICT_4X4_50
-)
 
-if hasattr(aruco, "ArucoDetector"):
+class PredictionSmoother:
+    def __init__(self):
+        self.history = deque(maxlen=SMOOTHING_WINDOW)
+        self.state = None
 
-    detector = aruco.ArucoDetector(
-        dictionary,
-        aruco.DetectorParameters()
-    )
+    def reset(self):
+        self.history.clear()
+        self.state = None
 
-    def detect(gray):
-        return detector.detectMarkers(gray)
+    def update(self, label):
+        self.history.append(label)
+        if label is not None:
+            count = sum(value == label for value in self.history)
+            if count >= MIN_STABLE_VOTES:
+                self.state = label
+                return self.state
 
-else:
+        if self.state is not None:
+            count = sum(value == self.state for value in self.history)
+            if count >= 2:
+                return self.state
 
-    parameters = aruco.DetectorParameters_create()
-
-    def detect(gray):
-        return aruco.detectMarkers(
-            gray,
-            dictionary,
-            parameters=parameters
-        )
-
-# =====================================
-# POSE ESTIMATION
-# =====================================
-
-def estimate_marker_poses(corners, ids):
-
-    poses = {}
-
-    if ids is None:
-        return poses
-
-    h = MARKER_SIZE / 2
-
-    object_points = np.array([
-        [-h, h, 0],
-        [h, h, 0],
-        [h, -h, 0],
-        [-h, -h, 0]
-    ], dtype=np.float32)
-
-    for corner, marker_id in zip(
-        corners,
-        ids.flatten()
-    ):
-
-        success, rvec, tvec = cv2.solvePnP(
-            object_points,
-            corner.reshape(4, 2).astype(np.float32),
-            CAMERA_MATRIX,
-            DIST_COEFFS,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
-        )
-
-        if success:
-
-            R, _ = cv2.Rodrigues(rvec)
-
-            poses[int(marker_id)] = (
-                R,
-                tvec.reshape(3)
-            )
-
-    return poses
-
-# =====================================
-# FEATURES
-# =====================================
-
-def extract_features(poses):
-
-    reference_id = MARKER_IDS["head"]
-
-    if reference_id not in poses:
+        self.state = None
         return None
 
-    R_ref, t_ref = poses[reference_id]
 
-    features = []
-
-    for marker_id in MARKER_IDS.values():
-
-        if marker_id not in poses:
-            return None
-
-        R, t = poses[marker_id]
-
-        R_relative = R_ref.T @ R
-
-        t_relative = R_ref.T @ (
-            t - t_ref
+def load_model():
+    if not MODEL_FILE.is_file():
+        raise FileNotFoundError(
+            f"Trained model not found at {MODEL_FILE}. "
+            "Run train_classifier.py after collecting A-Z poses."
         )
-
-        rvec, _ = cv2.Rodrigues(
-            R_relative
+    bundle = joblib.load(MODEL_FILE)
+    if bundle.get("schema_version") != MODEL_SCHEMA_VERSION:
+        raise ValueError(
+            "Model feature schema is incompatible. Retrain with train_classifier.py."
         )
-
-        features.extend(
-            t_relative.tolist()
+    classes = tuple(bundle.get("classes", ()))
+    if not classes or any(label not in LETTER_LABELS for label in classes):
+        raise ValueError(
+            "Model bundle has no valid letter classes. Retrain the model."
         )
-
-        features.extend(
-            rvec.flatten().tolist()
+    model = bundle.get("model")
+    if model is None or tuple(model.classes_) != classes:
+        raise ValueError(
+            "Model classes do not match the saved class metadata. Retrain the model."
         )
+    return model, classes
 
-    return np.array(
-        features,
-        dtype=np.float32
-    )
 
-# =====================================
-# LIVE INFERENCE
-# =====================================
+def predict_letter(model, features):
+    probabilities = model.predict_proba(np.asarray(features).reshape(1, -1))[0]
+    best_index = int(np.argmax(probabilities))
+    confidence = float(probabilities[best_index])
+    label = model.classes_[best_index]
+    return (label if confidence >= MIN_CONFIDENCE else None), confidence
 
-cap = cv2.VideoCapture(0)
 
-if not cap.isOpened():
-    raise RuntimeError(
-        "Could not open webcam"
-    )
+def process_camera():
+    model, classes = load_model()
+    calibration = load_camera_calibration(CALIBRATION_FILE)
+    capture = cv2.VideoCapture(CAMERA_INDEX)
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open camera {CAMERA_INDEX}.")
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-while True:
+    smoother = PredictionSmoother()
+    consecutive_read_failures = 0
+    try:
+        while True:
+            success, frame = capture.read()
+            if not success:
+                consecutive_read_failures += 1
+                if consecutive_read_failures >= 10:
+                    raise RuntimeError("Camera repeatedly failed to provide frames.")
+                continue
+            consecutive_read_failures = 0
 
-    ret, frame = cap.read()
+            camera_matrix, distortion = camera_matrix_for_frame(calibration, frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = detect_markers(gray)
+            poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
+            features = extract_pose_features(poses)
 
-    if not ret:
-        break
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-    gray = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2GRAY
-    )
+            if features is None:
+                smoother.reset()
+                text = "Unknown: show all markers 0-5"
+                colour = (0, 0, 255)
+            else:
+                label, confidence = predict_letter(model, features)
+                state = smoother.update(label)
+                text = (
+                    f"{state} ({confidence:.0%})"
+                    if state is not None
+                    else f"Uncertain ({confidence:.0%})"
+                )
+                colour = (0, 255, 0) if state is not None else (0, 165, 255)
 
-    corners, ids, _ = detect(gray)
+            cv2.putText(
+                frame,
+                text,
+                (15, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                colour,
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"Classes {','.join(classes)} | Esc: quit",
+                (15, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+            cv2.imshow("Robot A-Z Pose Classifier", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
 
-    poses = estimate_marker_poses(
-        corners,
-        ids
-    )
 
-    if ids is not None:
-
-        aruco.drawDetectedMarkers(
-            frame,
-            corners,
-            ids
-        )
-
-    features = extract_features(
-        poses
-    )
-
-    prediction_text = "Missing markers"
-
-    colour = (0, 0, 255)
-
-    if features is not None:
-
-        sample = features.reshape(1, -1)
-
-        prediction = model.predict(
-            sample
-        )[0]
-
-        confidence = max(
-            model.predict_proba(
-                sample
-            )[0]
-        )
-
-        prediction_text = (
-            f"{prediction} "
-            f"({confidence:.1%})"
-        )
-
-        colour = (0, 255, 0)
-
-    cv2.putText(
-        frame,
-        prediction_text,
-        (20, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,
-        colour,
-        3
-    )
-
-    cv2.imshow(
-        "Letter Classifier",
-        frame
-    )
-
-    key = cv2.waitKey(1)
-
-    if key == ord("q"):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    process_camera()
