@@ -1,0 +1,16 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+kpt_shape: [3, 3]
+flip_idx: [0, 1, 2]
+
+nc: 1
+names: ['hand']
+
+roboflow:
+  workspace: test-cfkot
+  project: my-first-project-psm7p
+  version: 1
+  license: Private
+  url: https://app.roboflow.com/test-cfkot/my-first-project-psm7p/1
