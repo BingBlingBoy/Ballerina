@@ -1,18 +1,23 @@
+from pathlib import Path
 from ultralytics import YOLO
 
 
 def main():
-  # 1. Load the pretrained YOLOv8 nano pose model
+  # 1. Define your decode directory path dynamically
+  decode_dir = Path(__file__).resolve().parent
+
+  # 2. Load the pretrained YOLOv8 nano pose model
   model = YOLO("yolov8n-pose.pt")
 
-  # 2. Train the model using your custom dataset configuration
-  # Assuming your dataset YAML is located inside robot_pose_poc/dataset/data.yaml
+  # 3. Train the model and force output runs inside decode/runs/
   model.train(
       data="robot_pose_poc/dataset/data.yaml",
-      epochs=30,  # 30 epochs is ideal for a small custom PoC
-      imgsz=640,  # Standard input image size for YOLO
-      device="cpu",  # Forces local CPU execution
-      batch=2,  # Small batch size to run smoothly on local hardware
+      epochs=30,
+      imgsz=640,
+      device="cpu",
+      batch=2,
+      project=str(decode_dir / "runs"),  # Forces base output into decode/runs
+      name="pose_train",  # Folder name for this specific run
   )
 
 
