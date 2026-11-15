@@ -16,7 +16,7 @@ MARKER_IDS = {
 MARKER_SIZE_METERS = 0.04
 CALIBRATION_FILE = Path(__file__).with_name("camera_calibration.npz")
 MAX_REPROJECTION_ERROR_PX = 3.0
-MODEL_SCHEMA_VERSION = 4
+MODEL_SCHEMA_VERSION = 5
 LETTER_LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 TARGET_LABELS = {
@@ -48,7 +48,20 @@ POSE_FEATURE_GROUPS = {
 POSE_MASK_COLUMNS = {
     name: f"observed_{name}" for name in POSE_FEATURE_GROUPS
 }
+LED_FEATURE_COLUMNS = ("led_red_on", "led_blue_on")
+LED_VALID_COLUMN = "led_state_valid"
+LED_DETECTOR_COLUMN = "led_detector_version"
+LED_DETECTOR_VERSION = "head-marker-camera-profile-v3"
 MIN_CLASSIFICATION_PARTS = 2
+LEGACY_LETTER_DATASET_COLUMNS = (
+    "session_id",
+    "capture_id",
+    "timestamp_utc",
+    "label",
+    "visible_marker_ids",
+    *POSE_MASK_COLUMNS.values(),
+    *POSE_FEATURE_COLUMNS,
+)
 LETTER_DATASET_COLUMNS = (
     "session_id",
     "capture_id",
@@ -56,6 +69,20 @@ LETTER_DATASET_COLUMNS = (
     "label",
     "visible_marker_ids",
     *POSE_MASK_COLUMNS.values(),
+    *LED_FEATURE_COLUMNS,
+    LED_VALID_COLUMN,
+    LED_DETECTOR_COLUMN,
+    *POSE_FEATURE_COLUMNS,
+)
+PREVIOUS_LETTER_DATASET_COLUMNS = (
+    "session_id",
+    "capture_id",
+    "timestamp_utc",
+    "label",
+    "visible_marker_ids",
+    *POSE_MASK_COLUMNS.values(),
+    *LED_FEATURE_COLUMNS,
+    LED_VALID_COLUMN,
     *POSE_FEATURE_COLUMNS,
 )
 

@@ -8,9 +8,12 @@ import numpy as np
 from robot_vision.robot_pose_features import (
     CALIBRATION_FILE,
     LETTER_LABELS,
+    LED_FEATURE_COLUMNS,
+    MARKER_IDS,
     MIN_CLASSIFICATION_PARTS,
     MODEL_SCHEMA_VERSION,
     POSE_FEATURE_GROUPS,
+    POSE_FEATURE_COLUMNS,
     camera_matrix_for_frame,
     detect_markers,
     estimate_marker_poses,
@@ -18,6 +21,11 @@ from robot_vision.robot_pose_features import (
     feature_indices_for_mask,
     load_camera_calibration,
     observable_part_count,
+)
+from robot_vision.led_features import (
+    detect_led_states,
+    led_state_label,
+    load_led_calibration,
 )
 
 
@@ -83,18 +91,38 @@ def load_model():
     return models, classes
 
 
-def predict_letter(model, features, group_mask=None):
+def predict_letter(model, features, group_mask=None, led_states=None):
     if group_mask is None:
         group_mask = (True,) * len(POSE_FEATURE_GROUPS)
     group_mask = tuple(group_mask)
     part_count = observable_part_count(group_mask)
     if part_count < MIN_CLASSIFICATION_PARTS:
         return None, 0.0
-    mask_model = model.get(group_mask)
+    use_leds = led_states is not None
+    mask_key = (group_mask, use_leds)
+    if mask_key not in model and use_leds:
+        mask_key = (group_mask, False)
+        use_leds = False
+    mask_model = model.get(mask_key)
     if mask_model is None:
         return None, 0.0
     feature_indices = feature_indices_for_mask(group_mask)
-    observed_features = np.asarray(features, dtype=np.float64)[list(feature_indices)]
+    observed_features = np.asarray(features, dtype=np.float64)
+    if use_leds:
+        led_values = np.asarray(led_states, dtype=np.float64)
+        if led_values.shape != (len(LED_FEATURE_COLUMNS),) or not np.isin(
+            led_values, (0, 1)
+        ).all():
+            return None, 0.0
+        observed_features = np.concatenate((observed_features, led_values))
+        feature_indices = (
+            *feature_indices,
+            *range(
+                len(POSE_FEATURE_COLUMNS),
+                len(POSE_FEATURE_COLUMNS) + len(LED_FEATURE_COLUMNS),
+            ),
+        )
+    observed_features = observed_features[list(feature_indices)]
     if not np.isfinite(observed_features).all():
         return None, 0.0
 
@@ -109,6 +137,7 @@ def predict_letter(model, features, group_mask=None):
 def process_camera():
     model, classes = load_model()
     calibration = load_camera_calibration(CALIBRATION_FILE)
+    led_calibration = load_led_calibration()
     capture = cv2.VideoCapture(CAMERA_INDEX)
     if not capture.isOpened():
         raise RuntimeError(f"Could not open camera {CAMERA_INDEX}.")
@@ -132,6 +161,13 @@ def process_camera():
             corners, ids, _ = detect_markers(gray)
             poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
             features, group_mask = extract_pose_observation(poses)
+            led_states = detect_led_states(
+                frame,
+                poses.get(MARKER_IDS["head"]),
+                camera_matrix,
+                distortion,
+                led_calibration,
+            )
             visible_markers = sorted(poses)
 
             if ids is not None:
@@ -145,12 +181,20 @@ def process_camera():
                 smoother.reset()
                 text = "Unknown: insufficient visible pose"
                 colour = (0, 0, 255)
-            elif group_mask not in model:
+            elif (
+                (group_mask, True) not in model
+                and (group_mask, False) not in model
+            ):
                 smoother.reset()
                 text = "Unknown: visibility pattern not trained"
                 colour = (0, 0, 255)
             else:
-                label, confidence = predict_letter(model, features, group_mask)
+                label, confidence = predict_letter(
+                    model,
+                    features,
+                    group_mask,
+                    led_states,
+                )
                 state = smoother.update(label)
                 text = (
                     f"{state} ({confidence:.0%})"
@@ -185,6 +229,16 @@ def process_camera():
                 frame,
                 visible_text,
                 (15, 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 0),
+                1,
+            )
+            cv2.putText(
+                frame,
+                f"LED red: {led_state_label(led_states, 0)} | "
+                f"blue: {led_state_label(led_states, 1)}",
+                (15, 140),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
                 (255, 255, 0),
