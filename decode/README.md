@@ -1,46 +1,54 @@
-# CPU-only A-Z whole-body pose pipeline
+# CPU-only A-Z hand/head pose pipeline
 
-The collector records **static whole-body poses** under labels A-Z. Pressing a
+The collector records **static hand/head poses** under labels A-Z. Pressing a
 letter assigns that label to the current pose; it does not move the robot or
 determine motion direction. For example, press `A` while holding the pose you
 want to label A. `Q` is a valid class label. Press **Esc** to quit.
 
-The camera uses the ArUco `DICT_4X4_50` dictionary and marker IDs 0-5:
+The camera uses the ArUco `DICT_4X4_50` dictionary. The decoder uses these
+markers:
 
 | ID | Mounting |
 |---|---|
 | 0 | Head |
-| 1 | Left shoulder |
-| 2 | Right shoulder |
+| 1 or 2 | Alternative binary signal markers; not pose markers |
 | 3 | Left hand |
 | 4 | Right hand |
-| 5 | Stationary base/reference; must not move with the torso |
+| 5 | Stationary base/reference |
 
 Use 40 mm square markers, mounted rigidly and with consistent printed-face
 orientation. Collect samples with the marker visibility patterns you expect in
-operation. Complete-visibility samples are useful as a baseline, but are not
-required to train a supported partial-visibility model.
+operation. IDs 1 and 2 are treated only as an alternative signal: ID 1 alone or
+ID 2 alone is a valid signal state. If both or neither is detected, that signal
+is unknown. Their positions are not used to estimate robot pose. Complete-pose
+visibility is useful as a baseline, but is not required to train a supported
+partial-visibility model.
 Mount the red and blue LEDs at distinct, visible positions on the robot head.
 Switch each LED on/off to provide two binary features alongside the pose.
 Before recording, calibrate the LED locations relative to the head marker as
 described below. The LEDs must be on the same flat surface as that marker. The
 software reads LED states but does not control the hardware.
-For a cardboard prototype, use a stationary base, a torso that rotates relative
-to it, and independently movable head and arms. The camera must see all markers
-for complete captures. Live decoding and collection can use partial
-observations; both report valid marker poses and observable feature groups.
-This verifies the software path; poses collected from a mock-up may not
-generalize to a finished robot.
+The decoder estimates hand and head marker poses relative to the stationary
+base. Without a torso marker, torso rotation cannot be isolated from arm motion,
+and head pitch cannot be separated from torso rotation. These states are not
+classified independently. Partial observations can still classify when at
+least two of the left hand, right hand, and head features are available relative
+to the base.
 
 ## Record, train, and run
 
 Run commands from the `decode` directory.
+Camera commands default to camera index `0`; select another camera with
+`--camera <index>` (for example, `--camera 1`). Use the same camera index for
+camera calibration, LED calibration, collection, and live inference. OpenCV
+indices are device numbers, not camera names; try `0`, `1`, and so on if you are
+unsure which number belongs to your camera.
 
 1. Calibrate the webcam using the checkerboard. The pictured board has 9 by 6
    squares, or 8 by 5 inner corners; each square is 1.5 cm:
 
    ```powershell
-   python robot_vision\calibrate_camera.py --columns 8 --rows 5 --square-size 0.015 --samples 15
+   python robot_vision\calibrate_camera.py --camera 1 --columns 8 --rows 5 --square-size 0.015 --samples 15
    ```
 
    Show the entire flat board at different positions and angles. Press `c` for
@@ -51,7 +59,7 @@ Run commands from the `decode` directory.
 2. Calibrate the LED locations, then start recording:
 
    ```powershell
-   python robot_vision\calibrate_leds.py
+   python robot_vision\calibrate_leds.py --camera 1
    ```
 
    Keep head marker ID 0 visible. Turn both LEDs on, click the center of the red
@@ -69,14 +77,20 @@ Run commands from the `decode` directory.
    Start the collector:
 
    ```powershell
-   python robot_vision\collect_robot_data.py
+   python robot_vision\collect_robot_data.py --camera 1
    ```
 
-   Hold a settled pose and press its A-Z label. Every letter is available,
-   including `Q`; **Esc** exits. Each label capture records up to 20 samples at
-   approximately 10 Hz when at least two body parts are observable. The CSV
+   Hold a settled pose and press its A-Z label. To teach the repeat command,
+   hold its own distinct pose and press `~`; to teach the word boundary, hold
+   another distinct pose and press **Space**. These train the special `~` and
+   `SPACE` classes. Every letter is available, including `Q`; **Esc** exits.
+   Each label capture records up to 20 samples at approximately 10 Hz when at
+   least two hand/head features are observable. The CSV
    stores valid marker IDs and an explicit observed-feature mask for every row;
    unavailable pose feature values are left blank, never replaced with zero.
+   The `marker_signal` field records `id1` or `id2` only when exactly one of
+   those markers is detected; both/neither is stored as unknown. Samples are
+   still retained based on pose visibility when the signal is unknown.
    It also stores red and blue LED states when the calibrated head-marker
    regions are available. Confirm that both on-screen states change as you
    switch each light. If the head marker is missing, too small, or uncalibrated,
@@ -112,37 +126,56 @@ Run commands from the `decode` directory.
    python train_classifier.py --letters A B
    ```
 
-   For a quick A/B/C subset, use the individual flags:
+   To train a selected subset from A through H, use the corresponding flags.
+   For example, to train A-H:
 
    ```powershell
-   python train_classifier.py --a --b --c
+   python train_classifier.py --a --b --c --d --e --f --g --h
    ```
 
-   Any combination is supported, such as `python train_classifier.py --a
-   --c`. Use either the letter flags or `--letters`, not both.
+   Flags can be combined in any subset, such as
+   `python train_classifier.py --a --d --h`. Without flags, training still
+   includes all A-Z. Add `--repeat` to include the `~` class and `--space` to
+   include the word-boundary pose, for example
+   `python train_classifier.py --a --b --repeat --space`. These options can
+   also be combined with `--letters`, such as
+   `python train_classifier.py --letters A B --repeat --space`. Use either
+   A-H flags or `--letters`, not both.
 
    The selected subset is stored with the model, and live inference uses exactly
    those classes. Training prints session-held-out accuracy separately for each
-   visibility pattern it can train, and reports which patterns were skipped.
+   pose-visibility pattern and optional LED/ID 1-or-2 signal combination it can
+   train, and reports which patterns were skipped.
    At least one visibility pattern must have enough examples for every selected
    label; complete visibility is not required. The dataset is written to
-   `robot_vision\robot_pose_letter_dataset.csv`; it is
-   separate from any pre-existing joint-state dataset. Older pose datasets are
-   migrated by adding blank/invalid LED fields; their existing marker and pose
-   data remains available for pose-only classifiers.
+   `robot_vision\robot_pose_letter_dataset_no_shoulders.csv`. It is separate
+   from the previous shoulder-based dataset and any pre-existing joint-state
+   dataset. Older datasets without the `marker_signal` column are incompatible;
+   the collector leaves them unchanged and asks you to move them aside before
+   starting a fresh collection.
 
-4. Run live whole-body pose inference:
+4. Run live hand/head pose inference:
 
    ```powershell
-   python main.py
+   python main.py --camera 1
    ```
 
    The live result uses a visibility-specific classifier, a five-frame voting
-   window, and a confidence threshold. It can classify from two or more
-   observable body parts (arms, torso, or head); a missing feature group does
-   not invalidate the others. Torso geometry and orientation count as one body
-   part. Frames with fewer than two observable body parts show as unknown.
-   Confidence is reduced for fewer observed body parts, and the window reports
+   window, and a 50% confidence threshold. Predictions above 50% appear green;
+   lower-confidence predictions still show their best-guess letter as uncertain.
+   The decoded word is not drawn on screen. Perform the trained
+   `~` pose after a letter to encode that letter twice (`A~` represents `AA`);
+   a `~` pose with no preceding letter is ignored. Perform the trained `SPACE`
+   pose, or press **Enter** while the camera window is focused, to print the
+   completed word to the console and clear the current buffer for the next word.
+   Press `!` to print the current word with `!` and end the message. It can classify from two or more
+   observable features (left hand, right hand, or head relative to the base); a
+   missing feature does not invalidate the others. When exactly one of ID 1 or
+   ID 2 is visible, the decoder uses a classifier trained with that signal when
+   one is available; if both or neither is visible, it can fall back to a
+   pose/LED-only classifier. Frames with fewer than two observable pose
+   features show as unknown.
+   Confidence is reduced for fewer observed features, and the window reports
    marker IDs with valid poses and the feature groups used. Press **Esc** to
    quit.
 
@@ -150,24 +183,27 @@ Run commands from the `decode` directory.
 
 Collection and live inference share feature extraction in
 [`robot_vision/robot_pose_features.py`](./robot_vision/robot_pose_features.py).
-The 24-value vector keeps the independently estimated arm, torso, and head
-features separate. Missing features are represented as unavailable, not zero:
-arm features need that arm's shoulder and hand; torso orientation needs the
-base and at least one shoulder; torso geometry needs both shoulders and the
-base; head features need the head and both shoulders. The trainer fits a small
-calibrated CPU classifier for feature combinations supported by the collected
-data. It can pool samples from different visibility masks when they all
-directly observe the model's required features; it never imputes a missing
-feature. One absent joint therefore does not discard other visible evidence,
+The 18-value vector contains left hand, right hand, and head poses relative to
+the stationary base marker. Each feature needs its marker and the base marker.
+Missing features are represented as unavailable, not zero. The trainer fits a
+small calibrated CPU classifier for feature combinations supported by the
+collected data. It can pool samples from different visibility masks when they
+all directly observe the model's required features; it never imputes a missing
+feature. One absent marker therefore does not discard other visible evidence,
 while unsupported feature combinations remain unknown.
+IDs 1 and 2 bypass pose estimation and contribute a categorical signal feature
+only when exactly one ID is detected. If both or neither is detected, that
+feature is unknown; inference can still use a model trained without it.
 Pose estimates with duplicate marker IDs, failed solves, or excessive
 reprojection error are rejected. Camera calibration is stored locally and
 ignored by Git.
 
 The model bundle contains calibrated RBF SVMs for supported pose-feature
-combinations, with LED-aware and pose-only variants when data supports them.
-Inference prefers an LED-aware model when trained and otherwise falls back to
-pose-only. Only rows recorded by the calibrated head-marker ROI detector are
+combinations, with LED-aware, ID-signal-aware, and pose-only variants when data
+supports them. Both/neither ID signal observations are excluded from
+ID-signal-aware training. Inference prefers models that use available LED and
+ID signal evidence and falls back to trained models without those optional
+signals. Only rows recorded by the calibrated head-marker ROI detector are
 used to train LED-aware models; older LED readings remain available in the CSV
 but are ignored for LED training. An unlit LED and an occluded or undetected
 LED still look alike within its expected region, so keep the LEDs unobstructed

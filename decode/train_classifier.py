@@ -18,14 +18,17 @@ from robot_vision.robot_pose_features import (
     LED_DETECTOR_VERSION,
     LED_FEATURE_COLUMNS,
     LED_VALID_COLUMN,
-    LEGACY_LETTER_DATASET_COLUMNS,
-    PREVIOUS_LETTER_DATASET_COLUMNS,
+    MARKER_SIGNAL_COLUMN,
+    MARKER_SIGNAL_FEATURE_COLUMNS,
     MIN_CLASSIFICATION_PARTS,
     MODEL_SCHEMA_VERSION,
     MARKER_IDS,
     POSE_FEATURE_COLUMNS,
     POSE_FEATURE_GROUPS,
     POSE_MASK_COLUMNS,
+    POSE_CLASS_LABELS,
+    REPEAT_LABEL,
+    SPACE_LABEL,
     SUPPORTED_GROUP_MASKS,
     feature_indices_for_mask,
     feature_group_mask_for_marker_ids,
@@ -34,7 +37,9 @@ from robot_vision.robot_pose_features import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATASET_FILE = SCRIPT_DIR / "robot_vision" / "robot_pose_letter_dataset.csv"
+DATASET_FILE = (
+    SCRIPT_DIR / "robot_vision" / "robot_pose_letter_dataset_no_shoulders.csv"
+)
 MODEL_FILE = SCRIPT_DIR / "models" / "pose_letter_classifier.joblib"
 
 
@@ -73,23 +78,12 @@ def _contains_feature_groups(observed_mask, required_mask):
     )
 
 
-def _normalize_dataset_schema(dataset):
-    dataset = dataset.copy()
-    if tuple(dataset.columns) == LEGACY_LETTER_DATASET_COLUMNS:
-        dataset[LED_FEATURE_COLUMNS[0]] = np.nan
-        dataset[LED_FEATURE_COLUMNS[1]] = np.nan
-        dataset[LED_VALID_COLUMN] = 0
-        dataset[LED_DETECTOR_COLUMN] = ""
-        dataset = dataset.loc[:, LETTER_DATASET_COLUMNS]
-    elif tuple(dataset.columns) == PREVIOUS_LETTER_DATASET_COLUMNS:
-        dataset[LED_DETECTOR_COLUMN] = ""
-        dataset = dataset.loc[:, LETTER_DATASET_COLUMNS]
-    elif tuple(dataset.columns) != LETTER_DATASET_COLUMNS:
+def _validate_dataset_schema(dataset):
+    if tuple(dataset.columns) != LETTER_DATASET_COLUMNS:
         raise ValueError(
-            "Dataset schema does not match the A-Z pose pipeline. "
-            "Record data with robot_vision/collect_robot_data.py."
+            "Dataset schema does not match the no-shoulder A-Z pose pipeline. "
+            "Collect fresh data with robot_vision/collect_robot_data.py."
         )
-    return dataset
 
 
 def _validate_observation_rows(dataset, features):
@@ -150,7 +144,7 @@ def _validate_observation_rows(dataset, features):
                 )
         if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
             raise ValueError(
-                f"Dataset row {row_index} has fewer than two observable body parts."
+                f"Dataset row {row_index} has fewer than two observable features."
             )
 
     return group_masks
@@ -185,7 +179,7 @@ def split_by_session(features, labels, groups, selected_letters):
 
 
 def train_model(dataset, selected_letters=LETTER_LABELS):
-    dataset = _normalize_dataset_schema(dataset)
+    _validate_dataset_schema(dataset)
 
     requested_letters = tuple(
         dict.fromkeys(str(letter).strip().upper() for letter in selected_letters)
@@ -193,7 +187,7 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
     if not requested_letters:
         raise ValueError("Select at least one letter to train.")
     invalid_letters = [
-        letter for letter in requested_letters if letter not in LETTER_LABELS
+        letter for letter in requested_letters if letter not in POSE_CLASS_LABELS
     ]
     if invalid_letters:
         raise ValueError(
@@ -201,7 +195,7 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
         )
     selected_set = set(requested_letters)
     selected_letters = tuple(
-        letter for letter in LETTER_LABELS if letter in selected_set
+        letter for letter in POSE_CLASS_LABELS if letter in selected_set
     )
 
     dataset = dataset.copy()
@@ -232,6 +226,18 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
 
     features = dataset.loc[:, POSE_FEATURE_COLUMNS].to_numpy(dtype=np.float64)
     led_features = dataset.loc[:, LED_FEATURE_COLUMNS].to_numpy(dtype=np.float64)
+    marker_signals = (
+        dataset[MARKER_SIGNAL_COLUMN].astype("string").fillna("").str.strip()
+    )
+    if not marker_signals.isin(("", "id1", "id2")).all():
+        raise ValueError("Marker signal values must be blank, id1, or id2.")
+    marker_signal_features = np.column_stack(
+        (
+            marker_signals.eq("id1").to_numpy(dtype=np.float64),
+            marker_signals.eq("id2").to_numpy(dtype=np.float64),
+        )
+    )
+    marker_signal_valid = marker_signals.isin(("id1", "id2")).to_numpy()
     group_masks = _validate_observation_rows(dataset, features)
     led_valid = dataset[LED_VALID_COLUMN].to_numpy(dtype=np.float64)
     if not np.isfinite(led_valid).all() or not np.isin(led_valid, (0, 1)).all():
@@ -260,82 +266,101 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
         if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
             continue
         for use_leds in (False, True):
-            matching_rows = np.array(
-                [
-                    _contains_feature_groups(observed_mask, group_mask)
-                    and (not use_leds or is_led_valid)
-                    for observed_mask, is_led_valid in zip(
-                        group_masks,
-                        valid_led_rows,
-                    )
-                ],
-                dtype=bool,
-            )
-            pattern_features = features[matching_rows]
-            if use_leds and len(pattern_features):
+            for use_marker_signal in (False, True):
+                matching_rows = np.array(
+                    [
+                        _contains_feature_groups(observed_mask, group_mask)
+                        and (not use_leds or is_led_valid)
+                        and (not use_marker_signal or has_marker_signal)
+                        for observed_mask, is_led_valid, has_marker_signal in zip(
+                            group_masks,
+                            valid_led_rows,
+                            marker_signal_valid,
+                        )
+                    ],
+                    dtype=bool,
+                )
                 pattern_features = np.column_stack(
-                    (pattern_features, led_features[matching_rows])
+                    (
+                        features[matching_rows],
+                        led_features[matching_rows],
+                        marker_signal_features[matching_rows],
+                    )
                 )
-            pattern_labels = labels.loc[matching_rows].reset_index(drop=True)
-            pattern_groups = groups.loc[matching_rows].reset_index(drop=True)
-            pattern_name = (
-                f"{_format_group_mask(group_mask)} + red/blue LEDs"
-                if use_leds
-                else _format_group_mask(group_mask)
-            )
-            if not len(pattern_features):
-                pattern_reports.append(
-                    f"Skipped [{pattern_name}]: no compatible observations."
-                )
-                continue
+                pattern_labels = labels.loc[matching_rows].reset_index(drop=True)
+                pattern_groups = groups.loc[matching_rows].reset_index(drop=True)
+                pattern_components = [_format_group_mask(group_mask)]
+                if use_leds:
+                    pattern_components.append("red/blue LEDs")
+                if use_marker_signal:
+                    pattern_components.append("ID 1/2 signal")
+                pattern_name = " + ".join(pattern_components)
+                if not len(pattern_features):
+                    pattern_reports.append(
+                        f"Skipped [{pattern_name}]: no compatible observations."
+                    )
+                    continue
 
-            try:
-                train_indices, test_indices = split_by_session(
-                    pattern_features,
-                    pattern_labels,
-                    pattern_groups,
-                    selected_letters,
-                )
-            except ValueError as error:
-                pattern_reports.append(
-                    f"Skipped [{pattern_name}]: {error}"
-                )
-                continue
+                try:
+                    train_indices, test_indices = split_by_session(
+                        pattern_features,
+                        pattern_labels,
+                        pattern_groups,
+                        selected_letters,
+                    )
+                except ValueError as error:
+                    pattern_reports.append(
+                        f"Skipped [{pattern_name}]: {error}"
+                    )
+                    continue
 
-            training_counts = pattern_labels.iloc[train_indices].value_counts()
-            insufficient_training = [
-                label
-                for label in selected_letters
-                if training_counts.get(label, 0) < 3
-            ]
-            if insufficient_training:
-                pattern_reports.append(
-                    f"Skipped [{pattern_name}]: fewer than three "
-                    "training samples for "
-                    f"{', '.join(insufficient_training)}."
-                )
-                continue
+                training_counts = pattern_labels.iloc[train_indices].value_counts()
+                insufficient_training = [
+                    label for label in selected_letters
+                    if training_counts.get(label, 0) < 3
+                ]
+                if insufficient_training:
+                    pattern_reports.append(
+                        f"Skipped [{pattern_name}]: fewer than three "
+                        "training samples for "
+                        f"{', '.join(insufficient_training)}."
+                    )
+                    continue
 
-            feature_indices = feature_indices_for_mask(group_mask)
-            if use_leds:
-                feature_indices = (*feature_indices, *range(
-                    len(POSE_FEATURE_COLUMNS),
-                    len(POSE_FEATURE_COLUMNS) + len(LED_FEATURE_COLUMNS),
-                ))
-            mask_model = _fit_classifier(
-                pattern_features[train_indices][:, feature_indices],
-                pattern_labels.iloc[train_indices],
-            )
-            models[(group_mask, use_leds)] = mask_model
-            predictions = mask_model.predict(
-                pattern_features[test_indices][:, feature_indices]
-            )
-            score = accuracy_score(pattern_labels.iloc[test_indices], predictions)
-            pattern_reports.append(
-                f"Trained [{pattern_name}]: "
-                f"{len(pattern_features)} compatible observations, "
-                f"session-held-out accuracy {score:.3f}."
-            )
+                feature_indices = feature_indices_for_mask(group_mask)
+                if use_leds:
+                    feature_indices = (
+                        *feature_indices,
+                        *range(
+                            len(POSE_FEATURE_COLUMNS),
+                            len(POSE_FEATURE_COLUMNS) + len(LED_FEATURE_COLUMNS),
+                        ),
+                    )
+                if use_marker_signal:
+                    feature_start = (
+                        len(POSE_FEATURE_COLUMNS) + len(LED_FEATURE_COLUMNS)
+                    )
+                    feature_indices = (
+                        *feature_indices,
+                        *range(
+                            feature_start,
+                            feature_start + len(MARKER_SIGNAL_FEATURE_COLUMNS),
+                        ),
+                    )
+                mask_model = _fit_classifier(
+                    pattern_features[train_indices][:, feature_indices],
+                    pattern_labels.iloc[train_indices],
+                )
+                models[(group_mask, use_leds, use_marker_signal)] = mask_model
+                predictions = mask_model.predict(
+                    pattern_features[test_indices][:, feature_indices]
+                )
+                score = accuracy_score(pattern_labels.iloc[test_indices], predictions)
+                pattern_reports.append(
+                    f"Trained [{pattern_name}]: "
+                    f"{len(pattern_features)} compatible observations, "
+                    f"session-held-out accuracy {score:.3f}."
+                )
 
     if not models:
         print(
@@ -355,7 +380,7 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
     print(f"Samples: {len(dataset)} across {groups.nunique()} recording sessions")
     print(
         f"Feature combinations: {len(models)} trained of "
-        f"{2 * len(SUPPORTED_GROUP_MASKS)} supported"
+        f"{4 * len(SUPPORTED_GROUP_MASKS)} supported"
     )
     for report in pattern_reports:
         print(report)
@@ -369,35 +394,38 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the CPU-friendly whole-body pose letter classifier."
+        description="Train the CPU-friendly hand/head pose letter classifier."
     )
     parser.add_argument(
         "--letters",
         nargs="+",
         type=str.upper,
-        choices=LETTER_LABELS,
+        choices=POSE_CLASS_LABELS,
         default=None,
         metavar="LETTER",
-        help="Letters to train (default: all A-Z), e.g. --letters A B.",
+        help="Classes to train, including ~ for repeat (default: A-Z), e.g. --letters A B.",
     )
     parser.add_argument(
-        "--a",
+        "--repeat",
         action="store_true",
-        help="Train the A class (combine with --b and/or --c).",
+        help="Include the dedicated ~ repeat-pose class with selected letters.",
     )
     parser.add_argument(
-        "--b",
+        "--space",
         action="store_true",
-        help="Train the B class (combine with --a and/or --c).",
+        help="Include the dedicated Space word-boundary pose class.",
     )
-    parser.add_argument(
-        "--c",
-        action="store_true",
-        help="Train the C class (combine with --a and/or --b).",
-    )
+    for label in "ABCDEFGH":
+        parser.add_argument(
+            f"--{label.lower()}",
+            action="store_true",
+            help=f"Include the {label} class when training (combine with other letter flags).",
+        )
     args = parser.parse_args()
-    if args.letters is not None and (args.a or args.b or args.c):
-        parser.error("use either --letters or the individual --a/--b/--c flags")
+    if args.letters is not None and any(
+        getattr(args, label.lower()) for label in "ABCDEFGH"
+    ):
+        parser.error("use either --letters or individual A-H flags")
     return args
 
 
@@ -412,11 +440,15 @@ def main():
     else:
         selected_letters = [
             label
-            for label in ("A", "B", "C")
+            for label in "ABCDEFGH"
             if getattr(args, label.lower())
         ]
         if not selected_letters:
             selected_letters = LETTER_LABELS
+    if args.repeat:
+        selected_letters = (*selected_letters, REPEAT_LABEL)
+    if args.space:
+        selected_letters = (*selected_letters, SPACE_LABEL)
     bundle = train_model(pd.read_csv(DATASET_FILE), selected_letters)
     MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, MODEL_FILE)

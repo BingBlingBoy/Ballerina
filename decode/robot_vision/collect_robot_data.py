@@ -1,6 +1,5 @@
+import argparse
 import csv
-import os
-import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,15 +17,17 @@ if __package__:
         LED_DETECTOR_VERSION,
         LED_FEATURE_COLUMNS,
         LED_VALID_COLUMN,
-        LEGACY_LETTER_DATASET_COLUMNS,
         MARKER_IDS,
-        PREVIOUS_LETTER_DATASET_COLUMNS,
+        MARKER_SIGNAL_COLUMN,
+        REPEAT_LABEL,
+        SPACE_LABEL,
         POSE_FEATURE_GROUPS,
         camera_matrix_for_frame,
         detect_markers,
         estimate_marker_poses,
         extract_pose_observation,
         load_camera_calibration,
+        marker_signal_from_ids,
         observable_part_count,
     )
     from .led_features import (
@@ -43,29 +44,48 @@ else:
         LED_DETECTOR_VERSION,
         LED_FEATURE_COLUMNS,
         LED_VALID_COLUMN,
-        LEGACY_LETTER_DATASET_COLUMNS,
         MARKER_IDS,
-        PREVIOUS_LETTER_DATASET_COLUMNS,
+        MARKER_SIGNAL_COLUMN,
+        REPEAT_LABEL,
+        SPACE_LABEL,
         POSE_FEATURE_GROUPS,
         camera_matrix_for_frame,
         detect_markers,
         estimate_marker_poses,
         extract_pose_observation,
         load_camera_calibration,
+        marker_signal_from_ids,
         observable_part_count,
     )
     from led_features import detect_led_states, led_state_label, load_led_calibration
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CSV_FILE = SCRIPT_DIR / "robot_pose_letter_dataset.csv"
+CSV_FILE = SCRIPT_DIR / "robot_pose_letter_dataset_no_shoulders.csv"
 CAMERA_INDEX = 0
 BURST_SAMPLES = 20
 SAMPLE_INTERVAL_SECONDS = 0.1
 BURST_TIMEOUT_SECONDS = 15.0
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Collect labeled robot poses with a selected camera."
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=CAMERA_INDEX,
+        help=f"Camera device index (default: {CAMERA_INDEX}).",
+    )
+    return parser.parse_args()
+
+
 def label_from_key(key):
+    if key == ord(REPEAT_LABEL):
+        return REPEAT_LABEL
+    if key == ord(" "):
+        return SPACE_LABEL
     if ord("A") <= key <= ord("Z"):
         key += ord("a") - ord("A")
     if ord("a") <= key <= ord("z"):
@@ -85,55 +105,10 @@ def ensure_dataset():
         header = tuple(next(reader, ()) or ())
         if header == LETTER_DATASET_COLUMNS:
             return
-        if header not in (
-            LEGACY_LETTER_DATASET_COLUMNS,
-            PREVIOUS_LETTER_DATASET_COLUMNS,
-        ):
-            raise RuntimeError(
-                f"{CSV_FILE} has an incompatible dataset schema. Move it aside "
-                "or start a new dataset; existing rows were not changed."
-            )
-        rows = list(reader)
-
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            newline="",
-            encoding="utf-8",
-            dir=CSV_FILE.parent,
-            delete=False,
-        ) as migrated:
-            temporary_path = Path(migrated.name)
-            writer = csv.writer(migrated)
-            writer.writerow(LETTER_DATASET_COLUMNS)
-            for row in rows:
-                if len(row) != len(header):
-                    raise RuntimeError(
-                        f"{CSV_FILE} contains a malformed legacy row; "
-                        "existing data was not changed."
-                    )
-                values = dict(zip(header, row))
-                previous_led_schema = header == PREVIOUS_LETTER_DATASET_COLUMNS
-                led_values = (
-                    [values[column] for column in header[10:13]]
-                    if previous_led_schema
-                    else ["", "", "0"]
-                )
-                feature_start = 13 if previous_led_schema else 10
-                writer.writerow(
-                    [
-                        *(values[column] for column in header[:10]),
-                        *led_values,
-                        "",
-                        *(values[column] for column in header[feature_start:]),
-                    ]
-                )
-        os.replace(temporary_path, CSV_FILE)
-    except Exception:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
-        raise
+    raise RuntimeError(
+        f"{CSV_FILE} has an incompatible dataset schema. The existing dataset "
+        "was left unchanged; move it aside before starting a fresh collection."
+    )
 
 
 def write_sample(
@@ -143,6 +118,7 @@ def write_sample(
     label,
     visible_markers,
     led_states,
+    marker_signal,
     features,
     group_mask,
 ):
@@ -154,6 +130,7 @@ def write_sample(
             label,
             ",".join(str(marker_id) for marker_id in sorted(visible_markers)),
             *[int(visible) for visible in group_mask],
+            f"id{marker_signal}" if marker_signal is not None else "",
             *(
                 [int(state) for state in led_states]
                 if led_states is not None
@@ -187,6 +164,7 @@ def record_burst(capture, calibration, led_calibration, session_id, label):
             camera_matrix, distortion = camera_matrix_for_frame(calibration, frame)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = detect_markers(gray)
+            marker_signal = marker_signal_from_ids(ids)
             poses = estimate_marker_poses(
                 corners,
                 ids,
@@ -209,10 +187,10 @@ def record_burst(capture, calibration, led_calibration, session_id, label):
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(display, corners, ids)
             status = (
-                f"Pose {label}: {saved}/{BURST_SAMPLES} | parts {part_count}/4"
+                f"Pose {label}: {saved}/{BURST_SAMPLES} | parts {part_count}/3"
                 if enough_observations
                 else (
-                    "Need 2 body parts | valid markers: "
+                    "Need 2 observable features | valid markers: "
                     f"{','.join(map(str, visible_markers)) or 'none'}"
                 )
             )
@@ -250,8 +228,17 @@ def record_burst(capture, calibration, led_calibration, session_id, label):
             )
             cv2.putText(
                 display,
+                f"Signal marker: {f'ID {marker_signal}' if marker_signal is not None else 'UNKNOWN'}",
+                (15, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 0),
+                1,
+            )
+            cv2.putText(
+                display,
                 "Esc: quit",
-                (15, 125),
+                (15, 150),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 0),
@@ -272,6 +259,7 @@ def record_burst(capture, calibration, led_calibration, session_id, label):
                     label,
                     visible_markers,
                     led_states,
+                    marker_signal,
                     features,
                     group_mask,
                 )
@@ -294,22 +282,22 @@ def record_burst(capture, calibration, led_calibration, session_id, label):
     return True
 
 
-def process_camera():
+def process_camera(camera_index=CAMERA_INDEX):
     ensure_dataset()
     calibration = load_camera_calibration(CALIBRATION_FILE)
     led_calibration = load_led_calibration()
-    capture = cv2.VideoCapture(CAMERA_INDEX)
+    capture = cv2.VideoCapture(camera_index)
     if not capture.isOpened():
-        raise RuntimeError(f"Could not open camera {CAMERA_INDEX}.")
+        raise RuntimeError(f"Could not open camera {camera_index}.")
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     session_id = uuid.uuid4().hex
     consecutive_read_failures = 0
-    print("Hold a settled pose and press its letter A-Z.")
-    print("The letter labels the pose; Q records the Q pose like any other letter.")
+    print("Hold a settled pose and press A-Z, ~ (repeat), or Space (word boundary).")
+    print("Each key labels one static pose; Q is an ordinary letter class.")
     print(
         "Each capture records up to 20 samples at about 10 Hz when at least "
-        "two body parts are observable."
+        "two hand/head features are observable relative to the base."
     )
     print(
         "Record complete poses and separate, intentionally occluded captures "
@@ -336,6 +324,7 @@ def process_camera():
             camera_matrix, distortion = camera_matrix_for_frame(calibration, frame)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = detect_markers(gray)
+            marker_signal = marker_signal_from_ids(ids)
             poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
             _, group_mask = extract_pose_observation(poses)
             visible_markers = sorted(poses)
@@ -353,12 +342,17 @@ def process_camera():
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(display, corners, ids)
             status = (
-                f"Ready: {part_count}/4 body parts"
+                f"Ready: {part_count}/3 observable features"
                 if enough_observations
-                else "Need at least 2 observable body parts"
+                else "Need at least 2 observable features"
             )
             status += (
                 f" | valid markers: {','.join(map(str, visible_markers)) or 'none'}"
+            )
+            status += (
+                f" | signal: ID {marker_signal}"
+                if marker_signal is not None
+                else " | signal: unknown"
             )
             cv2.putText(
                 display,
@@ -400,7 +394,7 @@ def process_camera():
             )
             cv2.putText(
                 display,
-                "Move to pose, settle, press A-Z; Esc quits",
+                "Move to pose, settle, press A-Z, ~, or Space; Esc quits",
                 (15, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -427,4 +421,4 @@ def process_camera():
 
 
 if __name__ == "__main__":
-    process_camera()
+    process_camera(parse_args().camera)

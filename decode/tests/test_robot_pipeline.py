@@ -9,29 +9,39 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from main import PredictionSmoother, predict_letter
+from main import (
+    LetterWordBuffer,
+    PredictionSmoother,
+    parse_args as parse_main_args,
+    predict_letter,
+)
 from robot_vision.robot_pose_features import (
     LETTER_DATASET_COLUMNS,
     LETTER_LABELS,
-    LEGACY_LETTER_DATASET_COLUMNS,
     MARKER_IDS,
     MARKER_SIZE_METERS,
     LED_DETECTOR_COLUMN,
     LED_DETECTOR_VERSION,
     LED_FEATURE_COLUMNS,
     LED_VALID_COLUMN,
-    PREVIOUS_LETTER_DATASET_COLUMNS,
+    MARKER_SIGNAL_COLUMN,
+    MARKER_SIGNAL_FEATURE_COLUMNS,
+    MARKER_SIGNAL_IDS,
     POSE_FEATURE_GROUPS,
     POSE_FEATURE_COLUMNS,
     POSE_MASK_COLUMNS,
+    SPACE_LABEL,
     estimate_marker_poses,
     extract_features,
     extract_pose_observation,
     extract_pose_features,
+    feature_group_mask_for_marker_ids,
+    marker_signal_from_ids,
 )
 from robot_vision.collect_robot_data import (
     ensure_dataset,
     label_from_key,
+    parse_args as parse_collector_args,
     write_sample,
 )
 from robot_vision.led_features import (
@@ -60,14 +70,6 @@ def pose_set(yaw=0.0, left_hand_height=0.3):
 
     return {
         MARKER_IDS["base"]: (np.eye(3), np.zeros(3)),
-        MARKER_IDS["left_shoulder"]: (
-            rotation,
-            rotated([-0.1, 0.0, 0.5]),
-        ),
-        MARKER_IDS["right_shoulder"]: (
-            rotation,
-            rotated([0.1, 0.0, 0.5]),
-        ),
         MARKER_IDS["head"]: (rotation, rotated([0.0, 0.0, 0.7])),
         MARKER_IDS["left_hand"]: (
             rotation,
@@ -81,20 +83,14 @@ def pose_set(yaw=0.0, left_hand_height=0.3):
 
 
 class RobotFeatureTests(unittest.TestCase):
-    def test_missing_base_preserves_arm_and_head_features(self):
+    def test_missing_base_disables_base_relative_features(self):
         poses = pose_set()
         del poses[MARKER_IDS["base"]]
         features, mask = extract_pose_observation(poses)
 
         self.assertIsNone(extract_pose_features(poses))
-        self.assertTrue(mask[0])
-        self.assertTrue(mask[1])
-        self.assertFalse(mask[2])
-        self.assertFalse(mask[3])
-        self.assertTrue(mask[4])
-        self.assertTrue(
-            np.isfinite(features[list(POSE_FEATURE_GROUPS["left_arm"])]).all()
-        )
+        self.assertEqual(mask, (False, False, False))
+        self.assertTrue(np.isnan(features).all())
 
     def test_missing_hand_preserves_other_joint_features(self):
         poses = pose_set()
@@ -105,44 +101,47 @@ class RobotFeatureTests(unittest.TestCase):
         self.assertFalse(mask[0])
         self.assertTrue(mask[1])
         self.assertTrue(mask[2])
-        self.assertTrue(mask[3])
-        self.assertTrue(mask[4])
         self.assertTrue(
             np.isnan(features[list(POSE_FEATURE_GROUPS["left_arm"])]).all()
         )
 
-    def test_single_shoulder_supports_torso_orientation_not_geometry_or_head(self):
+    def test_only_head_hand_and_base_markers_are_registered(self):
         poses = pose_set()
-        del poses[MARKER_IDS["right_shoulder"]]
         features, mask = extract_pose_observation(poses)
 
-        self.assertTrue(mask[0])
-        self.assertTrue(mask[3])
-        self.assertFalse(mask[2])
-        self.assertFalse(mask[4])
-        self.assertTrue(
-            np.isfinite(features[list(POSE_FEATURE_GROUPS["torso_orientation"])]).all()
+        self.assertEqual(set(MARKER_IDS), {"head", "left_hand", "right_hand", "base"})
+        self.assertEqual(len(mask), 3)
+        self.assertTrue(all(mask))
+        self.assertEqual(set(extract_features(poses)), {"left_arm", "right_arm", "head"})
+
+    def test_feature_visibility_uses_only_registered_markers(self):
+        self.assertEqual(
+            feature_group_mask_for_marker_ids((1, 2, 3, 4, 5)),
+            (True, True, False),
         )
-        self.assertTrue(
-            np.isnan(features[list(POSE_FEATURE_GROUPS["torso_geometry"])]).all()
-        )
+
+    def test_marker_signal_requires_exactly_one_signal_id(self):
+        self.assertEqual(marker_signal_from_ids(np.array([[1], [3]])), 1)
+        self.assertEqual(marker_signal_from_ids(np.array([[2]])), 2)
+        self.assertIsNone(marker_signal_from_ids(np.array([[1], [2]])))
+        self.assertIsNone(marker_signal_from_ids(np.array([[3]])))
+        self.assertIsNone(marker_signal_from_ids(None))
 
     def test_feature_groups_are_independent_when_base_is_missing(self):
         poses = pose_set()
         del poses[MARKER_IDS["base"]]
         features = extract_features(poses)
 
-        self.assertIsNotNone(features["left_arm"])
-        self.assertIsNotNone(features["right_arm"])
-        self.assertIsNotNone(features["head"])
-        self.assertIsNone(features["torso"])
+        self.assertIsNone(features["left_arm"])
+        self.assertIsNone(features["right_arm"])
+        self.assertIsNone(features["head"])
 
-    def test_torso_yaw_is_observable_and_head_feature_is_relative(self):
+    def test_head_and_arm_features_are_relative_to_stationary_base(self):
         neutral = extract_features(pose_set())
         rotated = extract_features(pose_set(yaw=np.deg2rad(30)))
 
-        self.assertFalse(np.allclose(neutral["torso"], rotated["torso"]))
-        np.testing.assert_allclose(neutral["head"], rotated["head"], atol=1e-6)
+        self.assertFalse(np.allclose(neutral["left_arm"], rotated["left_arm"]))
+        self.assertFalse(np.allclose(neutral["head"], rotated["head"]))
 
     def test_arm_height_changes_only_corresponding_arm_vector(self):
         low = extract_features(pose_set(left_hand_height=0.3))
@@ -187,28 +186,67 @@ class RobotFeatureTests(unittest.TestCase):
             [0.0, 0.0, 0.8],
             atol=1e-4,
         )
+        ignored_poses = estimate_marker_poses(
+            [corners.reshape(1, 4, 2), corners.reshape(1, 4, 2)],
+            np.array([[1], [2]]),
+            camera_matrix,
+            distortion,
+        )
+        self.assertEqual(ignored_poses, {})
 
 
 class AlphabetPipelineTests(unittest.TestCase):
+    def test_camera_flags_are_available_for_collection_and_live_inference(self):
+        with patch("sys.argv", ["main.py", "--camera", "2"]):
+            self.assertEqual(parse_main_args().camera, 2)
+        with patch(
+            "sys.argv",
+            ["collect_robot_data.py", "--camera", "1"],
+        ):
+            self.assertEqual(parse_collector_args().camera, 1)
+
     def test_training_letter_flags_select_requested_classes(self):
-        with patch("sys.argv", ["train_classifier.py", "--a", "--c"]):
+        with patch(
+            "sys.argv",
+            ["train_classifier.py", "--a", "--c", "--h"],
+        ):
             args = parse_args()
         selected = tuple(
             label
-            for label in ("A", "B", "C")
+            for label in "ABCDEFGH"
             if getattr(args, label.lower())
         )
-        self.assertEqual(selected, ("A", "C"))
+        self.assertEqual(selected, ("A", "C", "H"))
 
     def test_training_letters_option_remains_available(self):
         with patch("sys.argv", ["train_classifier.py", "--letters", "B", "D"]):
             args = parse_args()
         self.assertEqual(args.letters, ["B", "D"])
 
+    def test_repeat_class_can_be_requested_with_letter_flags_or_letters(self):
+        with patch("sys.argv", ["train_classifier.py", "--a", "--repeat"]):
+            args = parse_args()
+        self.assertTrue(args.a)
+        self.assertTrue(args.repeat)
+
+        with patch(
+            "sys.argv",
+            ["train_classifier.py", "--letters", "A", "B", "--repeat"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.letters, ["A", "B"])
+        self.assertTrue(args.repeat)
+
+    def test_space_class_can_be_requested_with_training_flags(self):
+        with patch("sys.argv", ["train_classifier.py", "--a", "--space"]):
+            args = parse_args()
+        self.assertTrue(args.a)
+        self.assertTrue(args.space)
+
     def test_training_selection_options_are_mutually_exclusive(self):
         with patch(
             "sys.argv",
-            ["train_classifier.py", "--a", "--letters", "B"],
+            ["train_classifier.py", "--h", "--letters", "B"],
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
@@ -217,12 +255,14 @@ class AlphabetPipelineTests(unittest.TestCase):
         for label in LETTER_LABELS:
             self.assertEqual(label_from_key(ord(label.lower())), label)
             self.assertEqual(label_from_key(ord(label)), label)
+        self.assertEqual(label_from_key(ord("~")), "~")
+        self.assertEqual(label_from_key(ord(" ")), SPACE_LABEL)
         self.assertIsNone(label_from_key(27))
         self.assertEqual(label_from_key(ord("q")), "Q")
 
     def test_collector_writes_marker_and_feature_masks(self):
         features = np.full(len(POSE_FEATURE_COLUMNS), np.nan)
-        group_mask = (True, True, True, True, False)
+        group_mask = (True, True, False)
         features[: len(POSE_FEATURE_COLUMNS) - 6] = 1.0
         output = StringIO()
         writer = csv.writer(output)
@@ -232,8 +272,9 @@ class AlphabetPipelineTests(unittest.TestCase):
             "session",
             "capture",
             "A",
-            (1, 2, 3, 4, 5),
+            (0, 3, 4, 5),
             (False, True),
+            2,
             features,
             group_mask,
         )
@@ -244,9 +285,10 @@ class AlphabetPipelineTests(unittest.TestCase):
                 next(csv.reader(StringIO(output.getvalue()))),
             )
         )
-        self.assertEqual(row["visible_marker_ids"], "1,2,3,4,5")
+        self.assertEqual(row["visible_marker_ids"], "0,3,4,5")
         for name, observed in zip(POSE_MASK_COLUMNS, group_mask):
             self.assertEqual(row[POSE_MASK_COLUMNS[name]], str(int(observed)))
+        self.assertEqual(row[MARKER_SIGNAL_COLUMN], "id2")
         self.assertEqual(row[LED_FEATURE_COLUMNS[0]], "0")
         self.assertEqual(row[LED_FEATURE_COLUMNS[1]], "1")
         self.assertEqual(row[LED_VALID_COLUMN], "1")
@@ -262,79 +304,35 @@ class AlphabetPipelineTests(unittest.TestCase):
             "session",
             "capture",
             "A",
-            (0, 1, 2),
+            (0, 3, 4, 5),
+            None,
             None,
             features,
-            (True, False, False, False, True),
+            (False, False, False),
         )
         row = dict(zip(LETTER_DATASET_COLUMNS, next(csv.reader(StringIO(output.getvalue())))))
+        self.assertEqual(row[MARKER_SIGNAL_COLUMN], "")
         self.assertEqual(row[LED_FEATURE_COLUMNS[0]], "")
         self.assertEqual(row[LED_FEATURE_COLUMNS[1]], "")
         self.assertEqual(row[LED_VALID_COLUMN], "0")
         self.assertEqual(row[LED_DETECTOR_COLUMN], "")
 
-    def test_collector_migrates_legacy_dataset_without_losing_pose_data(self):
-        legacy_row = [
-            "session",
-            "capture",
-            "2026-01-01T00:00:00+00:00",
-            "A",
-            "0,1,2,3,4,5",
-            *["1"] * len(POSE_MASK_COLUMNS),
-            *["0.25"] * len(POSE_FEATURE_COLUMNS),
-        ]
+    def test_collector_rejects_incompatible_dataset_without_changing_it(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset_path = Path(directory) / "dataset.csv"
             with dataset_path.open("w", newline="", encoding="utf-8") as dataset:
                 writer = csv.writer(dataset)
-                writer.writerow(LEGACY_LETTER_DATASET_COLUMNS)
-                writer.writerow(legacy_row)
+                writer.writerow(("legacy", "old", "dataset"))
+                writer.writerow(("keep", "all", "data"))
 
             with patch("robot_vision.collect_robot_data.CSV_FILE", dataset_path):
-                ensure_dataset()
+                with self.assertRaises(RuntimeError):
+                    ensure_dataset()
 
-            with dataset_path.open("r", newline="", encoding="utf-8") as dataset:
-                reader = csv.DictReader(dataset)
-                row = next(reader)
-                self.assertEqual(tuple(reader.fieldnames), LETTER_DATASET_COLUMNS)
-            self.assertEqual(row[LED_FEATURE_COLUMNS[0]], "")
-            self.assertEqual(row[LED_FEATURE_COLUMNS[1]], "")
-            self.assertEqual(row[LED_VALID_COLUMN], "0")
-            self.assertEqual(row[LED_DETECTOR_COLUMN], "")
-            self.assertEqual(row[POSE_FEATURE_COLUMNS[0]], "0.25")
-
-    def test_previous_led_dataset_migration_disables_uncalibrated_features(self):
-        previous_row = [
-            "session",
-            "capture",
-            "2026-01-01T00:00:00+00:00",
-            "A",
-            "0,1,2,3,4,5",
-            *["1"] * len(POSE_MASK_COLUMNS),
-            "1",
-            "0",
-            "1",
-            *["0.25"] * len(POSE_FEATURE_COLUMNS),
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            dataset_path = Path(directory) / "dataset.csv"
-            with dataset_path.open("w", newline="", encoding="utf-8") as dataset:
-                writer = csv.writer(dataset)
-                writer.writerow(PREVIOUS_LETTER_DATASET_COLUMNS)
-                writer.writerow(previous_row)
-
-            with patch("robot_vision.collect_robot_data.CSV_FILE", dataset_path):
-                ensure_dataset()
-
-            with dataset_path.open("r", newline="", encoding="utf-8") as dataset:
-                reader = csv.DictReader(dataset)
-                row = next(reader)
-                self.assertEqual(tuple(reader.fieldnames), LETTER_DATASET_COLUMNS)
-            self.assertEqual(row[LED_FEATURE_COLUMNS[0]], "1")
-            self.assertEqual(row[LED_FEATURE_COLUMNS[1]], "0")
-            self.assertEqual(row[LED_VALID_COLUMN], "1")
-            self.assertEqual(row[LED_DETECTOR_COLUMN], "")
-            self.assertEqual(row[POSE_FEATURE_COLUMNS[0]], "0.25")
+            self.assertEqual(
+                dataset_path.read_text(encoding="utf-8").splitlines(),
+                ["legacy,old,dataset", "keep,all,data"],
+            )
 
     def test_led_detector_uses_head_marker_relative_rois(self):
         frame = np.zeros((120, 200, 3), dtype=np.uint8)
@@ -513,10 +511,35 @@ class AlphabetPipelineTests(unittest.TestCase):
         smoother.reset()
         self.assertIsNone(smoother.update("B"))
 
+    def test_word_buffer_appends_stable_letters_once_and_finishes_with_bang(self):
+        buffer = LetterWordBuffer()
+        buffer.accept("~")
+        self.assertEqual(buffer.current_word, "")
+        buffer.accept("A")
+        buffer.accept("A")
+        buffer.accept("~")
+        buffer.accept("~")
+        buffer.accept("B")
+        self.assertEqual(buffer.current_word, "A~B")
+
+        self.assertEqual(buffer.accept(SPACE_LABEL), "A~B")
+        self.assertEqual(buffer.accept(SPACE_LABEL), None)
+        self.assertEqual(buffer.current_word, "")
+        self.assertEqual(buffer.output_text, "A~B")
+        buffer.accept("C")
+        self.assertEqual(buffer.finish_word(), "C")
+        self.assertEqual(buffer.current_word, "")
+        self.assertEqual(buffer.last_finalized, "C")
+        self.assertEqual(buffer.output_text, "A~B C")
+
+        buffer.accept("B")
+        self.assertEqual(buffer.current_word, "B")
+        self.assertEqual(buffer.finish(), "B!")
+
     def test_all_letter_models_train_and_predict(self):
         rows = []
         full_mask = (True,) * len(POSE_FEATURE_GROUPS)
-        partial_mask = (True, True, True, True, False)
+        partial_mask = (True, True, False)
         for label_index, label in enumerate(LETTER_LABELS):
             for session_index in range(4):
                 capture_id = f"{label}-{session_index}"
@@ -538,13 +561,16 @@ class AlphabetPipelineTests(unittest.TestCase):
                             "timestamp_utc": f"2026-01-01T00:00:{sample_index:02d}+00:00",
                             "label": label,
                             "visible_marker_ids": (
-                                "1,2,3,4,5" if not group_mask[-1] else "0,1,2,3,4,5"
+                                "3,4,5" if not group_mask[-1] else "0,3,4,5"
                             ),
                             **dict(
                                 zip(
                                     POSE_MASK_COLUMNS.values(),
                                     map(int, group_mask),
                                 )
+                            ),
+                            MARKER_SIGNAL_COLUMN: (
+                                "id1" if sample_index % 2 == 0 else "id2"
                             ),
                             LED_FEATURE_COLUMNS[0]: int(label_index & 1 != 0),
                             LED_FEATURE_COLUMNS[1]: int(label_index & 2 != 0),
@@ -565,21 +591,44 @@ class AlphabetPipelineTests(unittest.TestCase):
         partial_label, partial_confidence = predict_letter(
             bundle["model"], features, partial_mask, (False, False)
         )
-        self.assertIn(partial_label, (*LETTER_LABELS, None))
+        self.assertIn(partial_label, LETTER_LABELS)
         self.assertGreaterEqual(partial_confidence, 0.0)
         self.assertLessEqual(partial_confidence, 1.0)
-        torso_only_mask = (False, False, True, True, False)
+        uncertain_model = {
+            ((True, True, False), False, False): type(
+                "LowConfidenceModel",
+                (),
+                {
+                    "classes_": np.array(["A", "B"]),
+                    "predict_proba": lambda self, values: np.array([[0.55, 0.45]]),
+                },
+            )()
+        }
+        uncertain_label, uncertain_confidence = predict_letter(
+            uncertain_model,
+            features,
+            partial_mask,
+        )
+        self.assertEqual(uncertain_label, "A")
+        self.assertLess(uncertain_confidence, 0.60)
+        head_only_mask = (False, False, True)
         self.assertEqual(
-            predict_letter(bundle["model"], features, torso_only_mask),
+            predict_letter(bundle["model"], features, head_only_mask),
             (None, 0.0),
         )
-        uncollected_mask = (True, True, False, False, False)
-        self.assertIn((uncollected_mask, False), bundle["model"])
-        self.assertIn((uncollected_mask, True), bundle["model"])
+        uncollected_mask = (False, True, True)
+        self.assertIn((uncollected_mask, False, False), bundle["model"])
+        self.assertIn((uncollected_mask, True, False), bundle["model"])
+        self.assertIn((uncollected_mask, False, True), bundle["model"])
+        self.assertEqual(
+            len(MARKER_SIGNAL_FEATURE_COLUMNS),
+            2,
+        )
 
-    def test_training_can_select_only_a_and_b(self):
+    def test_training_can_select_letters_and_repeat_pose(self):
         rows = []
-        for label_index, label in enumerate(("A", "B")):
+        selected_classes = ("A", "B", SPACE_LABEL, "~")
+        for label_index, label in enumerate(selected_classes):
             for session_index in range(4):
                 capture_id = f"{label}-{session_index}"
                 for sample_index in range(4):
@@ -590,8 +639,8 @@ class AlphabetPipelineTests(unittest.TestCase):
                     values += np.arange(len(POSE_FEATURE_COLUMNS)) * 0.001
                     values += sample_index * 0.0001
                     group_mask = (
-                        (True, True, True, True, False)
-                        if label == "B"
+                        (True, True, False)
+                        if label in ("B", "~", SPACE_LABEL)
                         else (True,) * len(POSE_FEATURE_GROUPS)
                     )
                     if not group_mask[-1]:
@@ -603,7 +652,7 @@ class AlphabetPipelineTests(unittest.TestCase):
                             "timestamp_utc": f"2026-01-01T00:00:{sample_index:02d}+00:00",
                             "label": label,
                             "visible_marker_ids": (
-                                "1,2,3,4,5" if not group_mask[-1] else "0,1,2,3,4,5"
+                                "3,4,5" if not group_mask[-1] else "0,3,4,5"
                             ),
                             **dict(
                                 zip(
@@ -611,7 +660,10 @@ class AlphabetPipelineTests(unittest.TestCase):
                                     map(int, group_mask),
                                 )
                             ),
-                            LED_FEATURE_COLUMNS[0]: label_index,
+                            MARKER_SIGNAL_COLUMN: (
+                                "id1" if label == "A" else "id2"
+                            ),
+                            LED_FEATURE_COLUMNS[0]: 0,
                             LED_FEATURE_COLUMNS[1]: 0,
                             LED_VALID_COLUMN: 1,
                             LED_DETECTOR_COLUMN: LED_DETECTOR_VERSION,
@@ -620,26 +672,66 @@ class AlphabetPipelineTests(unittest.TestCase):
                     )
 
         dataset = pd.DataFrame(rows, columns=LETTER_DATASET_COLUMNS)
-        bundle = train_model(dataset, ("a", "b"))
-        self.assertEqual(bundle["classes"], ("A", "B"))
+        bundle = train_model(dataset, ("a", "b", "~", SPACE_LABEL))
+        self.assertEqual(bundle["classes"], selected_classes)
         full_mask = (True,) * len(POSE_FEATURE_GROUPS)
         self.assertNotIn(full_mask, bundle["model"])
-        partial_mask = (True, True, True, True, False)
+        partial_mask = (True, True, False)
         self.assertEqual(
-            tuple(bundle["model"][(partial_mask, False)].classes_),
-            ("A", "B"),
+            tuple(bundle["model"][(partial_mask, False, False)].classes_),
+            selected_classes,
         )
-        feature_values = dataset.loc[0, POSE_FEATURE_COLUMNS].to_numpy(
+        feature_values = dataset.loc[dataset["label"] == "A", POSE_FEATURE_COLUMNS].iloc[0].to_numpy(
             dtype=np.float64
         )
         partial_label, partial_confidence = predict_letter(
-            bundle["model"], feature_values, partial_mask, (0, 0)
+            bundle["model"],
+            feature_values,
+            partial_mask,
+            marker_signal=1,
         )
-        self.assertIn(partial_label, ("A", "B"))
+        self.assertEqual(partial_label, "A")
         self.assertGreaterEqual(partial_confidence, 0.60)
-        self.assertIn((partial_mask, True), bundle["model"])
+        b_features = dataset.loc[
+            dataset["label"] == "B",
+            POSE_FEATURE_COLUMNS,
+        ].iloc[0].to_numpy(dtype=np.float64)
+        other_signal_label, other_signal_confidence = predict_letter(
+            bundle["model"],
+            b_features,
+            partial_mask,
+            marker_signal=2,
+        )
+        self.assertEqual(other_signal_label, "B")
+        self.assertGreaterEqual(other_signal_confidence, 0.0)
+        repeat_features = dataset.loc[
+            dataset["label"] == "~",
+            POSE_FEATURE_COLUMNS,
+        ].iloc[0].to_numpy(dtype=np.float64)
+        repeat_label, repeat_confidence = predict_letter(
+            bundle["model"],
+            repeat_features,
+            partial_mask,
+            marker_signal=2,
+        )
+        self.assertEqual(repeat_label, "~")
+        self.assertGreaterEqual(repeat_confidence, 0.0)
+        space_features = dataset.loc[
+            dataset["label"] == SPACE_LABEL,
+            POSE_FEATURE_COLUMNS,
+        ].iloc[0].to_numpy(dtype=np.float64)
+        space_label, _ = predict_letter(
+            bundle["model"],
+            space_features,
+            partial_mask,
+            marker_signal=2,
+        )
+        self.assertEqual(space_label, SPACE_LABEL)
+        self.assertIn((partial_mask, False, True), bundle["model"])
+        self.assertIn((partial_mask, True, False), bundle["model"])
+        self.assertIn((partial_mask, True, True), bundle["model"])
         self.assertIn(
-            (partial_mask, False),
+            (partial_mask, False, False),
             bundle["model"],
         )
 
