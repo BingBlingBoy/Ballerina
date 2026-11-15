@@ -16,7 +16,7 @@ MARKER_IDS = {
 MARKER_SIZE_METERS = 0.04
 CALIBRATION_FILE = Path(__file__).with_name("camera_calibration.npz")
 MAX_REPROJECTION_ERROR_PX = 3.0
-MODEL_SCHEMA_VERSION = 2
+MODEL_SCHEMA_VERSION = 4
 LETTER_LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 TARGET_LABELS = {
@@ -38,11 +38,24 @@ DATASET_COLUMNS = (
     *(f"feature_{index}" for index in range(6)),
 )
 POSE_FEATURE_COLUMNS = tuple(f"feature_{index}" for index in range(24))
+POSE_FEATURE_GROUPS = {
+    "left_arm": tuple(range(0, 6)),
+    "right_arm": tuple(range(6, 12)),
+    "torso_geometry": tuple(range(12, 15)),
+    "torso_orientation": tuple(range(15, 18)),
+    "head": tuple(range(18, 24)),
+}
+POSE_MASK_COLUMNS = {
+    name: f"observed_{name}" for name in POSE_FEATURE_GROUPS
+}
+MIN_CLASSIFICATION_PARTS = 2
 LETTER_DATASET_COLUMNS = (
     "session_id",
     "capture_id",
     "timestamp_utc",
     "label",
+    "visible_marker_ids",
+    *POSE_MASK_COLUMNS.values(),
     *POSE_FEATURE_COLUMNS,
 )
 
@@ -198,13 +211,9 @@ def _mean_rotation(rotations):
 
 
 def extract_features(poses):
-    """Return one six-value vector per observable joint, or None if unavailable."""
+    """Return per-joint features, allowing torso orientation without its geometry."""
     features = {target: None for target in TARGET_LABELS}
     base = poses.get(MARKER_IDS["base"])
-    if base is None:
-        return features
-
-    base_rotation, base_translation = base
     left_shoulder = poses.get(MARKER_IDS["left_shoulder"])
     right_shoulder = poses.get(MARKER_IDS["right_shoulder"])
     head = poses.get(MARKER_IDS["head"])
@@ -233,22 +242,27 @@ def extract_features(poses):
             (relative_position, _rotation_vector(relative_rotation))
         ).astype(np.float32)
 
-    if left_shoulder is None or right_shoulder is None:
-        return features
+    shoulders = [pose for pose in (left_shoulder, right_shoulder) if pose is not None]
+    torso_rotation = None
+    if shoulders:
+        torso_rotation = _mean_rotation([rotation for rotation, _ in shoulders])
+        if base is not None:
+            base_rotation, _ = base
+            torso_rotation_in_base = base_rotation.T @ torso_rotation
+            torso_vector = np.full(6, np.nan, dtype=np.float32)
+            torso_vector[3:] = _rotation_vector(torso_rotation_in_base)
+            if left_shoulder is not None and right_shoulder is not None:
+                _, left_translation = left_shoulder
+                _, right_translation = right_shoulder
+                torso_vector[:3] = base_rotation.T @ (
+                    right_translation - left_translation
+                )
+            features["torso"] = torso_vector
 
-    left_rotation, left_translation = left_shoulder
-    right_rotation, right_translation = right_shoulder
-    torso_rotation = _mean_rotation([left_rotation, right_rotation])
-    shoulder_vector = base_rotation.T @ (
-        right_translation - left_translation
-    )
-    torso_rotation_in_base = base_rotation.T @ torso_rotation
-    features["torso"] = np.concatenate(
-        (shoulder_vector, _rotation_vector(torso_rotation_in_base))
-    ).astype(np.float32)
-
-    if head is not None:
+    if head is not None and left_shoulder is not None and right_shoulder is not None:
         head_rotation, head_translation = head
+        _, left_translation = left_shoulder
+        _, right_translation = right_shoulder
         shoulder_center = (left_translation + right_translation) / 2.0
         head_position_in_torso = torso_rotation.T @ (
             head_translation - shoulder_center
@@ -261,22 +275,105 @@ def extract_features(poses):
             )
         ).astype(np.float32)
 
-    for vector in features.values():
+    for target, vector in features.items():
         if vector is not None and not np.isfinite(vector).all():
-            return {target: None for target in TARGET_LABELS}
+            features[target] = np.where(
+                np.isfinite(vector), vector, np.nan
+            ).astype(np.float32)
 
     return features
 
 
-def extract_pose_features(poses):
-    """Return one whole-body vector only when every required marker is visible."""
+def extract_pose_observation(poses):
+    """Return a NaN-masked pose vector and the observable feature-group mask."""
     joint_features = extract_features(poses)
-    if any(vector is None for vector in joint_features.values()):
+    pose_features = np.full(len(POSE_FEATURE_COLUMNS), np.nan, dtype=np.float32)
+    available = {name: False for name in POSE_FEATURE_GROUPS}
+
+    for target in ("left_arm", "right_arm", "head"):
+        vector = joint_features[target]
+        if vector is not None and np.isfinite(vector).all():
+            indices = POSE_FEATURE_GROUPS[target]
+            pose_features[list(indices)] = vector
+            available[target] = True
+
+    torso = joint_features["torso"]
+    if torso is not None:
+        if np.isfinite(torso[:3]).all():
+            indices = POSE_FEATURE_GROUPS["torso_geometry"]
+            pose_features[list(indices)] = torso[:3]
+            available["torso_geometry"] = True
+        if np.isfinite(torso[3:]).all():
+            indices = POSE_FEATURE_GROUPS["torso_orientation"]
+            pose_features[list(indices)] = torso[3:]
+            available["torso_orientation"] = True
+
+    group_mask = tuple(available[name] for name in POSE_FEATURE_GROUPS)
+    return pose_features, group_mask
+
+
+def feature_indices_for_mask(group_mask):
+    if len(group_mask) != len(POSE_FEATURE_GROUPS):
+        raise ValueError("Feature-group mask has an unexpected size.")
+    return tuple(
+        index
+        for enabled, group_indices in zip(group_mask, POSE_FEATURE_GROUPS.values())
+        if enabled
+        for index in group_indices
+    )
+
+
+def observable_part_count(group_mask):
+    if len(group_mask) != len(POSE_FEATURE_GROUPS):
+        raise ValueError("Feature-group mask has an unexpected size.")
+    return sum(
+        (
+            bool(group_mask[0]),
+            bool(group_mask[1]),
+            bool(group_mask[2] or group_mask[3]),
+            bool(group_mask[4]),
+        )
+    )
+
+
+def feature_group_mask_for_marker_ids(marker_ids):
+    visible_ids = {int(marker_id) for marker_id in marker_ids}
+    left_shoulder = MARKER_IDS["left_shoulder"] in visible_ids
+    right_shoulder = MARKER_IDS["right_shoulder"] in visible_ids
+    base = MARKER_IDS["base"] in visible_ids
+    return (
+        left_shoulder and MARKER_IDS["left_hand"] in visible_ids,
+        right_shoulder and MARKER_IDS["right_hand"] in visible_ids,
+        base and left_shoulder and right_shoulder,
+        base and (left_shoulder or right_shoulder),
+        MARKER_IDS["head"] in visible_ids and left_shoulder and right_shoulder,
+    )
+
+
+def _supported_group_masks():
+    marker_ids = tuple(MARKER_IDS.values())
+    masks = set()
+    for marker_bits in range(1 << len(marker_ids)):
+        visible_ids = {
+            marker_id
+            for index, marker_id in enumerate(marker_ids)
+            if marker_bits & (1 << index)
+        }
+        mask = feature_group_mask_for_marker_ids(visible_ids)
+        if observable_part_count(mask) >= MIN_CLASSIFICATION_PARTS:
+            masks.add(mask)
+    return tuple(sorted(masks))
+
+
+SUPPORTED_GROUP_MASKS = _supported_group_masks()
+
+
+def extract_pose_features(poses):
+    """Return the legacy complete vector, or None when any feature is missing."""
+    pose_features, group_mask = extract_pose_observation(poses)
+    if not all(group_mask):
         return None
 
-    pose_features = np.concatenate(
-        [joint_features[target] for target in TARGET_LABELS]
-    ).astype(np.float32)
     if pose_features.shape != (len(POSE_FEATURE_COLUMNS),):
         raise RuntimeError("Whole-body feature schema has an unexpected size.")
     if not np.isfinite(pose_features).all():

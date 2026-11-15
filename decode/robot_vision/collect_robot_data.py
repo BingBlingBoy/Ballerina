@@ -12,22 +12,26 @@ if __package__:
         CALIBRATION_FILE,
         LETTER_DATASET_COLUMNS,
         LETTER_LABELS,
+        POSE_FEATURE_GROUPS,
         camera_matrix_for_frame,
         detect_markers,
         estimate_marker_poses,
-        extract_pose_features,
+        extract_pose_observation,
         load_camera_calibration,
+        observable_part_count,
     )
 else:
     from robot_pose_features import (
         CALIBRATION_FILE,
         LETTER_DATASET_COLUMNS,
         LETTER_LABELS,
+        POSE_FEATURE_GROUPS,
         camera_matrix_for_frame,
         detect_markers,
         estimate_marker_poses,
-        extract_pose_features,
+        extract_pose_observation,
         load_camera_calibration,
+        observable_part_count,
     )
 
 
@@ -63,13 +67,23 @@ def ensure_dataset():
         )
 
 
-def write_sample(writer, session_id, capture_id, label, features):
+def write_sample(
+    writer,
+    session_id,
+    capture_id,
+    label,
+    visible_markers,
+    features,
+    group_mask,
+):
     writer.writerow(
         [
             session_id,
             capture_id,
             datetime.now(timezone.utc).isoformat(),
             label,
+            ",".join(str(marker_id) for marker_id in sorted(visible_markers)),
+            *[int(visible) for visible in group_mask],
             *[float(value) for value in features],
         ]
     )
@@ -102,15 +116,21 @@ def record_burst(capture, calibration, session_id, label):
                 camera_matrix,
                 distortion,
             )
-            features = extract_pose_features(poses)
+            features, group_mask = extract_pose_observation(poses)
+            visible_markers = sorted(poses)
+            part_count = observable_part_count(group_mask)
+            enough_observations = part_count >= 2
 
             display = frame.copy()
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(display, corners, ids)
             status = (
-                f"Pose {label}: {saved}/{BURST_SAMPLES}"
-                if features is not None
-                else "Waiting for all six markers with valid poses"
+                f"Pose {label}: {saved}/{BURST_SAMPLES} | parts {part_count}/4"
+                if enough_observations
+                else (
+                    "Need 2 body parts | valid markers: "
+                    f"{','.join(map(str, visible_markers)) or 'none'}"
+                )
             )
             cv2.putText(
                 display,
@@ -121,7 +141,28 @@ def record_burst(capture, calibration, session_id, label):
                 (0, 255, 255),
                 2,
             )
-            cv2.putText(display, "Esc: quit", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            visible_text = (
+                f"Markers: {','.join(map(str, visible_markers)) or 'none'} | "
+                f"Features: {', '.join(name for name, visible in zip(POSE_FEATURE_GROUPS, group_mask) if visible) or 'none'}"
+            )
+            cv2.putText(
+                display,
+                visible_text,
+                (15, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 0),
+                1,
+            )
+            cv2.putText(
+                display,
+                "Esc: quit",
+                (15, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 0),
+                2,
+            )
             cv2.imshow("Robot Motion Data Recorder", display)
 
             key = cv2.waitKey(1) & 0xFF
@@ -129,16 +170,30 @@ def record_burst(capture, calibration, session_id, label):
                 return False
 
             now = time.monotonic()
-            if features is not None and now >= next_sample_at:
-                write_sample(writer, session_id, capture_id, label, features)
+            if enough_observations and now >= next_sample_at:
+                write_sample(
+                    writer,
+                    session_id,
+                    capture_id,
+                    label,
+                    visible_markers,
+                    features,
+                    group_mask,
+                )
                 saved += 1
                 next_sample_at = now + SAMPLE_INTERVAL_SECONDS
 
     if saved != BURST_SAMPLES:
-        print(
-            f"Only captured {saved}/{BURST_SAMPLES} samples for pose {label}; "
-            "the partial burst is retained and can be completed in another capture."
-        )
+        if saved:
+            print(
+                f"Captured {saved}/{BURST_SAMPLES} samples for pose {label}; "
+                "those samples were retained."
+            )
+        else:
+            print(
+                f"No samples saved for pose {label}; make at least two body "
+                "parts observable and try again."
+            )
     else:
         print(f"Saved {saved} samples for pose {label} (capture {capture_id[:8]}).")
     return True
@@ -154,9 +209,18 @@ def process_camera():
 
     session_id = uuid.uuid4().hex
     consecutive_read_failures = 0
-    print("Hold a complete, settled whole-body pose and press its letter A-Z.")
+    print("Hold a settled pose and press its letter A-Z.")
     print("The letter labels the pose; Q records the Q pose like any other letter.")
-    print("Each capture records 20 valid samples at about 10 Hz. Press Esc to quit.")
+    print(
+        "Each capture records up to 20 samples at about 10 Hz when at least "
+        "two body parts are observable."
+    )
+    print(
+        "Record complete poses and separate, intentionally occluded captures "
+        "across multiple sessions; unsupported visibility patterns are skipped "
+        "during training."
+    )
+    print("Press Esc to quit.")
 
     try:
         while True:
@@ -172,24 +236,54 @@ def process_camera():
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = detect_markers(gray)
             poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
-            features = extract_pose_features(poses)
+            _, group_mask = extract_pose_observation(poses)
+            visible_markers = sorted(poses)
+            part_count = observable_part_count(group_mask)
+            enough_observations = part_count >= 2
 
             display = frame.copy()
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(display, corners, ids)
+            status = (
+                f"Ready: {part_count}/4 body parts"
+                if enough_observations
+                else "Need at least 2 observable body parts"
+            )
+            status += (
+                f" | valid markers: {','.join(map(str, visible_markers)) or 'none'}"
+            )
             cv2.putText(
                 display,
-                "Ready to record" if features is not None else "Show all markers 0-5",
+                status,
                 (15, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0) if features is not None else (0, 0, 255),
+                0.52,
+                (0, 255, 0) if enough_observations else (0, 0, 255),
                 2,
             )
             cv2.putText(
                 display,
-                "Move to a pose, let it settle, press A-Z to label; Esc quits",
-                (15, 70),
+                (
+                    "Features: "
+                    + (
+                        ", ".join(
+                            name
+                            for name, visible in zip(POSE_FEATURE_GROUPS, group_mask)
+                            if visible
+                        )
+                        or "none"
+                    )
+                ),
+                (15, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 0),
+                1,
+            )
+            cv2.putText(
+                display,
+                "Move to pose, settle, press A-Z; Esc quits",
+                (15, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (255, 255, 0),
