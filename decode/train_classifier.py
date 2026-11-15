@@ -5,7 +5,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -14,14 +14,121 @@ from sklearn.svm import SVC
 from robot_vision.robot_pose_features import (
     LETTER_DATASET_COLUMNS,
     LETTER_LABELS,
+    MIN_CLASSIFICATION_PARTS,
     MODEL_SCHEMA_VERSION,
+    MARKER_IDS,
     POSE_FEATURE_COLUMNS,
+    POSE_FEATURE_GROUPS,
+    POSE_MASK_COLUMNS,
+    SUPPORTED_GROUP_MASKS,
+    feature_indices_for_mask,
+    feature_group_mask_for_marker_ids,
+    observable_part_count,
 )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATASET_FILE = SCRIPT_DIR / "robot_vision" / "robot_pose_letter_dataset.csv"
 MODEL_FILE = SCRIPT_DIR / "models" / "pose_letter_classifier.joblib"
+
+
+def _fit_classifier(features, labels):
+    classifier = CalibratedClassifierCV(
+        estimator=make_pipeline(
+            StandardScaler(),
+            SVC(
+                kernel="rbf",
+                C=10,
+                gamma="scale",
+                class_weight="balanced",
+                random_state=42,
+            ),
+        ),
+        method="sigmoid",
+        cv=3,
+    )
+    classifier.fit(features, labels)
+    return classifier
+
+
+def _format_group_mask(group_mask):
+    observed = [
+        name
+        for name, enabled in zip(POSE_FEATURE_GROUPS, group_mask)
+        if enabled
+    ]
+    return ", ".join(observed) if observed else "no observable features"
+
+
+def _contains_feature_groups(observed_mask, required_mask):
+    return all(
+        not required or observed
+        for observed, required in zip(observed_mask, required_mask)
+    )
+
+
+def _validate_observation_rows(dataset, features):
+    marker_id_values = set(MARKER_IDS.values())
+    group_columns = tuple(POSE_MASK_COLUMNS.values())
+    raw_masks = dataset.loc[:, group_columns].apply(pd.to_numeric, errors="coerce")
+    if raw_masks.isna().any().any() or not raw_masks.isin((0, 1)).all().all():
+        raise ValueError("Observation mask columns must contain only 0 or 1.")
+    group_masks = tuple(
+        tuple(bool(value) for value in row)
+        for row in raw_masks.to_numpy()
+    )
+
+    for row_index, (raw_marker_ids, values, group_mask) in enumerate(
+        zip(dataset["visible_marker_ids"], features, group_masks)
+    ):
+        marker_text = str(raw_marker_ids).strip()
+        try:
+            marker_ids = (
+                tuple(int(value) for value in marker_text.split(","))
+                if marker_text
+                else ()
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid visible_marker_ids at dataset row {row_index}."
+            ) from error
+        if (
+            len(marker_ids) != len(set(marker_ids))
+            or not set(marker_ids).issubset(marker_id_values)
+        ):
+            raise ValueError(
+                f"Invalid visible_marker_ids at dataset row {row_index}."
+            )
+        possible_mask = feature_group_mask_for_marker_ids(marker_ids)
+        if any(
+            enabled and not possible
+            for enabled, possible in zip(group_mask, possible_mask)
+        ):
+            raise ValueError(
+                f"Observed feature mask requires an absent marker at dataset "
+                f"row {row_index}."
+            )
+        if np.isinf(values).any():
+            raise ValueError(f"Infinite feature value at dataset row {row_index}.")
+
+        for enabled, indices in zip(group_mask, POSE_FEATURE_GROUPS.values()):
+            group_values = values[list(indices)]
+            if enabled and not np.isfinite(group_values).all():
+                raise ValueError(
+                    f"Observed feature group is incomplete at dataset row "
+                    f"{row_index}."
+                )
+            if not enabled and np.isfinite(group_values).any():
+                raise ValueError(
+                    f"Unobserved feature group contains values at dataset row "
+                    f"{row_index}."
+                )
+        if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
+            raise ValueError(
+                f"Dataset row {row_index} has fewer than two observable body parts."
+            )
+
+    return group_masks
 
 
 def split_by_session(features, labels, groups, selected_letters):
@@ -83,8 +190,8 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
         :, POSE_FEATURE_COLUMNS
     ].apply(pd.to_numeric, errors="coerce")
     dataset = dataset.dropna(
-        subset=[*POSE_FEATURE_COLUMNS, "capture_id", "session_id"]
-    )
+        subset=["capture_id", "session_id", "visible_marker_ids"]
+    ).reset_index(drop=True)
 
     observed_labels = set(dataset["label"])
     missing_labels = [
@@ -96,62 +203,101 @@ def train_model(dataset, selected_letters=LETTER_LABELS):
         )
 
     features = dataset.loc[:, POSE_FEATURE_COLUMNS].to_numpy(dtype=np.float64)
+    group_masks = _validate_observation_rows(dataset, features)
     labels = dataset["label"]
     groups = dataset["session_id"]
-    train_indices, test_indices = split_by_session(
-        features,
-        labels,
-        groups,
-        selected_letters,
-    )
+    models = {}
+    pattern_reports = []
+    for group_mask in SUPPORTED_GROUP_MASKS:
+        if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
+            continue
+        matching_rows = np.array(
+            [
+                _contains_feature_groups(observed_mask, group_mask)
+                for observed_mask in group_masks
+            ],
+            dtype=bool,
+        )
+        pattern_features = features[matching_rows]
+        pattern_labels = labels.loc[matching_rows].reset_index(drop=True)
+        pattern_groups = groups.loc[matching_rows].reset_index(drop=True)
+        if not len(pattern_features):
+            pattern_reports.append(
+                f"Skipped [{_format_group_mask(group_mask)}]: no samples "
+                "contain all required feature groups."
+            )
+            continue
 
-    training_counts = labels.iloc[train_indices].value_counts()
-    insufficient_training = [
-        label for label in selected_letters if training_counts.get(label, 0) < 3
-    ]
-    if insufficient_training:
+        try:
+            train_indices, test_indices = split_by_session(
+                pattern_features,
+                pattern_labels,
+                pattern_groups,
+                selected_letters,
+            )
+        except ValueError as error:
+            pattern_reports.append(
+                f"Skipped [{_format_group_mask(group_mask)}]: {error}"
+            )
+            continue
+
+        training_counts = pattern_labels.iloc[train_indices].value_counts()
+        insufficient_training = [
+            label
+            for label in selected_letters
+            if training_counts.get(label, 0) < 3
+        ]
+        if insufficient_training:
+            pattern_reports.append(
+                f"Skipped [{_format_group_mask(group_mask)}]: fewer than three "
+                "training samples for "
+                f"{', '.join(insufficient_training)}."
+            )
+            continue
+
+        feature_indices = feature_indices_for_mask(group_mask)
+        mask_model = _fit_classifier(
+            pattern_features[train_indices][:, feature_indices],
+            pattern_labels.iloc[train_indices],
+        )
+        models[group_mask] = mask_model
+        predictions = mask_model.predict(
+            pattern_features[test_indices][:, feature_indices]
+        )
+        score = accuracy_score(pattern_labels.iloc[test_indices], predictions)
+        pattern_reports.append(
+            f"Trained [{_format_group_mask(group_mask)}]: "
+            f"{len(pattern_features)} compatible observations, "
+            f"session-held-out accuracy {score:.3f}."
+        )
+
+    if not models:
+        print(
+            "No visibility pattern met the training requirements for all "
+            "selected labels:"
+        )
+        for report in pattern_reports:
+            print(report)
         raise ValueError(
-            "Each training letter needs at least three valid samples for "
-            f"probability calibration. Insufficient samples for: {', '.join(insufficient_training)}."
+            "No visibility pattern has enough data to train a classifier for "
+            "every selected label. For at least one set of common feature "
+            "groups, each selected label needs at least three training samples "
+            "and samples in at least two collector sessions. Marker visibility "
+            "patterns do not need to be identical."
         )
 
-    model = CalibratedClassifierCV(
-        estimator=make_pipeline(
-            StandardScaler(),
-            SVC(
-                kernel="rbf",
-                C=10,
-                gamma="scale",
-                class_weight="balanced",
-                random_state=42,
-            ),
-        ),
-        method="sigmoid",
-        cv=3,
-    )
-    model.fit(features[train_indices], labels.iloc[train_indices])
-    predictions = model.predict(features[test_indices])
-
+    print(f"Samples: {len(dataset)} across {groups.nunique()} recording sessions")
     print(
-        f"Samples: {len(dataset)} across {groups.nunique()} recording sessions"
+        f"Visibility patterns: {len(models)} trained of "
+        f"{len(SUPPORTED_GROUP_MASKS)} supported"
     )
-    print(
-        f"Session-held-out accuracy: "
-        f"{accuracy_score(labels.iloc[test_indices], predictions):.3f}"
-    )
-    print(
-        classification_report(
-            labels.iloc[test_indices],
-            predictions,
-            labels=selected_letters,
-            zero_division=0,
-        )
-    )
+    for report in pattern_reports:
+        print(report)
 
     return {
         "schema_version": MODEL_SCHEMA_VERSION,
         "classes": selected_letters,
-        "model": model,
+        "model": models,
     }
 
 
@@ -164,11 +310,29 @@ def parse_args():
         nargs="+",
         type=str.upper,
         choices=LETTER_LABELS,
-        default=LETTER_LABELS,
+        default=None,
         metavar="LETTER",
-        help="Letters to include (default: all A-Z), e.g. --letters A B.",
+        help="Letters to train (default: all A-Z), e.g. --letters A B.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--a",
+        action="store_true",
+        help="Train the A class (combine with --b and/or --c).",
+    )
+    parser.add_argument(
+        "--b",
+        action="store_true",
+        help="Train the B class (combine with --a and/or --c).",
+    )
+    parser.add_argument(
+        "--c",
+        action="store_true",
+        help="Train the C class (combine with --a and/or --b).",
+    )
+    args = parser.parse_args()
+    if args.letters is not None and (args.a or args.b or args.c):
+        parser.error("use either --letters or the individual --a/--b/--c flags")
+    return args
 
 
 def main():
@@ -177,7 +341,17 @@ def main():
             f"Dataset not found at {DATASET_FILE}. Record A-Z poses first."
         )
     args = parse_args()
-    bundle = train_model(pd.read_csv(DATASET_FILE), args.letters)
+    if args.letters is not None:
+        selected_letters = args.letters
+    else:
+        selected_letters = [
+            label
+            for label in ("A", "B", "C")
+            if getattr(args, label.lower())
+        ]
+        if not selected_letters:
+            selected_letters = LETTER_LABELS
+    bundle = train_model(pd.read_csv(DATASET_FILE), selected_letters)
     MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, MODEL_FILE)
     print(

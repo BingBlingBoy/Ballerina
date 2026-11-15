@@ -8,12 +8,16 @@ import numpy as np
 from robot_vision.robot_pose_features import (
     CALIBRATION_FILE,
     LETTER_LABELS,
+    MIN_CLASSIFICATION_PARTS,
     MODEL_SCHEMA_VERSION,
+    POSE_FEATURE_GROUPS,
     camera_matrix_for_frame,
     detect_markers,
     estimate_marker_poses,
-    extract_pose_features,
+    extract_pose_observation,
+    feature_indices_for_mask,
     load_camera_calibration,
+    observable_part_count,
 )
 
 
@@ -67,19 +71,38 @@ def load_model():
         raise ValueError(
             "Model bundle has no valid letter classes. Retrain the model."
         )
-    model = bundle.get("model")
-    if model is None or tuple(model.classes_) != classes:
+    models = bundle.get("model")
+    if not isinstance(models, dict) or not models:
+        raise ValueError(
+            "Model bundle has no visibility-aware classifiers. Retrain the model."
+        )
+    if any(tuple(model.classes_) != classes for model in models.values()):
         raise ValueError(
             "Model classes do not match the saved class metadata. Retrain the model."
         )
-    return model, classes
+    return models, classes
 
 
-def predict_letter(model, features):
-    probabilities = model.predict_proba(np.asarray(features).reshape(1, -1))[0]
+def predict_letter(model, features, group_mask=None):
+    if group_mask is None:
+        group_mask = (True,) * len(POSE_FEATURE_GROUPS)
+    group_mask = tuple(group_mask)
+    part_count = observable_part_count(group_mask)
+    if part_count < MIN_CLASSIFICATION_PARTS:
+        return None, 0.0
+    mask_model = model.get(group_mask)
+    if mask_model is None:
+        return None, 0.0
+    feature_indices = feature_indices_for_mask(group_mask)
+    observed_features = np.asarray(features, dtype=np.float64)[list(feature_indices)]
+    if not np.isfinite(observed_features).all():
+        return None, 0.0
+
+    probabilities = mask_model.predict_proba(observed_features.reshape(1, -1))[0]
     best_index = int(np.argmax(probabilities))
-    confidence = float(probabilities[best_index])
-    label = model.classes_[best_index]
+    evidence_factor = 0.56 + 0.11 * part_count
+    confidence = float(probabilities[best_index]) * evidence_factor
+    label = mask_model.classes_[best_index]
     return (label if confidence >= MIN_CONFIDENCE else None), confidence
 
 
@@ -92,6 +115,7 @@ def process_camera():
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     smoother = PredictionSmoother()
+    previous_group_mask = None
     consecutive_read_failures = 0
     try:
         while True:
@@ -107,17 +131,26 @@ def process_camera():
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = detect_markers(gray)
             poses = estimate_marker_poses(corners, ids, camera_matrix, distortion)
-            features = extract_pose_features(poses)
+            features, group_mask = extract_pose_observation(poses)
+            visible_markers = sorted(poses)
 
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            if features is None:
+            if previous_group_mask is not None and group_mask != previous_group_mask:
                 smoother.reset()
-                text = "Unknown: show all markers 0-5"
+            previous_group_mask = group_mask
+
+            if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
+                smoother.reset()
+                text = "Unknown: insufficient visible pose"
+                colour = (0, 0, 255)
+            elif group_mask not in model:
+                smoother.reset()
+                text = "Unknown: visibility pattern not trained"
                 colour = (0, 0, 255)
             else:
-                label, confidence = predict_letter(model, features)
+                label, confidence = predict_letter(model, features, group_mask)
                 state = smoother.update(label)
                 text = (
                     f"{state} ({confidence:.0%})"
@@ -143,6 +176,19 @@ def process_camera():
                 0.55,
                 (255, 255, 0),
                 2,
+            )
+            visible_text = (
+                f"Valid marker poses: {','.join(map(str, visible_markers)) or 'none'}"
+                f" | Features: {', '.join(name for name, visible in zip(POSE_FEATURE_GROUPS, group_mask) if visible) or 'none'}"
+            )
+            cv2.putText(
+                frame,
+                visible_text,
+                (15, 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 0),
+                1,
             )
             cv2.imshow("Robot A-Z Pose Classifier", frame)
             if cv2.waitKey(1) & 0xFF == 27:
