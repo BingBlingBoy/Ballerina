@@ -11,7 +11,6 @@ import pandas as pd
 
 from main import (
     LetterWordBuffer,
-    PredictionSmoother,
     parse_args as parse_main_args,
     predict_letter,
 )
@@ -502,39 +501,30 @@ class AlphabetPipelineTests(unittest.TestCase):
             set(sessions.iloc[train_indices]) & set(sessions.iloc[test_indices])
         )
 
-    def test_smoother_requires_multiple_consistent_predictions(self):
-        smoother = PredictionSmoother()
-        self.assertIsNone(smoother.update("A"))
-        self.assertIsNone(smoother.update("B"))
-        self.assertIsNone(smoother.update("A"))
-        self.assertEqual(smoother.update("A"), "A")
-        smoother.reset()
-        self.assertIsNone(smoother.update("B"))
-
-    def test_word_buffer_appends_stable_letters_once_and_finishes_with_bang(self):
+    def test_word_buffer_records_manual_inputs_and_finishes_words(self):
         buffer = LetterWordBuffer()
-        buffer.accept("~")
-        self.assertEqual(buffer.current_word, "")
-        buffer.accept("A")
-        buffer.accept("A")
-        buffer.accept("~")
-        buffer.accept("~")
-        buffer.accept("B")
-        self.assertEqual(buffer.current_word, "A~B")
+        self.assertFalse(buffer.record("~"))
+        self.assertTrue(buffer.record("A"))
+        self.assertTrue(buffer.record("A"))
+        self.assertTrue(buffer.record("~"))
+        self.assertFalse(buffer.record("~"))
+        self.assertTrue(buffer.record("B"))
+        self.assertEqual(buffer.current_word, "AA~B")
 
-        self.assertEqual(buffer.accept(SPACE_LABEL), "A~B")
-        self.assertEqual(buffer.accept(SPACE_LABEL), None)
+        self.assertFalse(buffer.record(SPACE_LABEL))
+        self.assertEqual(buffer.current_word, "AA~B")
+        self.assertEqual(buffer.output_text, "")
+        self.assertTrue(buffer.record("C"))
+        self.assertEqual(buffer.current_word, "AA~BC")
+        self.assertEqual(buffer.finish_word(), "AA~BC")
         self.assertEqual(buffer.current_word, "")
-        self.assertEqual(buffer.output_text, "A~B")
-        buffer.accept("C")
-        self.assertEqual(buffer.finish_word(), "C")
-        self.assertEqual(buffer.current_word, "")
-        self.assertEqual(buffer.last_finalized, "C")
-        self.assertEqual(buffer.output_text, "A~B C")
+        self.assertEqual(buffer.last_finalized, "AA~BC")
+        self.assertEqual(buffer.output_text, "AA~BC")
 
-        buffer.accept("B")
+        self.assertTrue(buffer.record("B"))
         self.assertEqual(buffer.current_word, "B")
         self.assertEqual(buffer.finish(), "B!")
+
 
     def test_all_letter_models_train_and_predict(self):
         rows = []

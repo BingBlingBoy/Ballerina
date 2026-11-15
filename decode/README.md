@@ -160,15 +160,17 @@ unsure which number belongs to your camera.
    python main.py --camera 1
    ```
 
-   The live result uses a visibility-specific classifier, a five-frame voting
-   window, and a 50% confidence threshold. Predictions above 50% appear green;
+   The live result uses a visibility-specific classifier and a 50% confidence
+   threshold. Predictions above 50% appear green;
    lower-confidence predictions still show their best-guess letter as uncertain.
-   The decoded word is not drawn on screen. Perform the trained
-   `~` pose after a letter to encode that letter twice (`A~` represents `AA`);
-   a `~` pose with no preceding letter is ignored. Perform the trained `SPACE`
-   pose, or press **Enter** while the camera window is focused, to print the
-   completed word to the console and clear the current buffer for the next word.
-   Press `!` to print the current word with `!` and end the message. It can classify from two or more
+   The decoded word is not drawn on screen. Focus the camera window and press
+   `#` (usually **Shift+3**) to record the currently predicted class. Pressing
+   `#` again records another copy of a letter. The trained `~` pose records a
+   repeat marker after a letter (`A~` represents `AA`); it must also be captured
+   with `#`. Press **Enter** to print the completed word to the console and
+   clear the current buffer for the next word. Press `!` to print the current
+   word with `!` and end the message. The `SPACE` pose no longer ends a word.
+   The decoder can classify from two or more
    observable features (left hand, right hand, or head relative to the base); a
    missing feature does not invalidate the others. When exactly one of ID 1 or
    ID 2 is visible, the decoder uses a classifier trained with that signal when

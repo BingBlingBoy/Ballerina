@@ -1,5 +1,4 @@
 import argparse
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -40,8 +39,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MODEL_FILE = SCRIPT_DIR / "models" / "pose_letter_classifier.joblib"
 CAMERA_INDEX = 0
 MIN_CONFIDENCE = 0.50
-SMOOTHING_WINDOW = 5
-MIN_STABLE_VOTES = 3
 
 
 def parse_args():
@@ -57,57 +54,19 @@ def parse_args():
     return parser.parse_args()
 
 
-class PredictionSmoother:
-    def __init__(self):
-        self.history = deque(maxlen=SMOOTHING_WINDOW)
-        self.state = None
-
-    def reset(self):
-        self.history.clear()
-        self.state = None
-
-    def update(self, label):
-        self.history.append(label)
-        if label is not None:
-            count = sum(value == label for value in self.history)
-            if count >= MIN_STABLE_VOTES:
-                self.state = label
-                return self.state
-
-        if self.state is not None:
-            count = sum(value == self.state for value in self.history)
-            if count >= 2:
-                return self.state
-
-        self.state = None
-        return None
-
-
 class LetterWordBuffer:
     def __init__(self):
         self.letters = []
-        self.last_letter = None
         self.last_finalized = ""
         self.completed_words = []
 
-    def accept(self, label):
-        if label is None:
-            self.last_letter = None
-            return None
-        if label == SPACE_LABEL:
-            if self.last_letter == SPACE_LABEL:
-                return None
-            self.last_letter = SPACE_LABEL
-            return self._finish_word("")
+    def record(self, label):
+        if label is None or label == SPACE_LABEL:
+            return False
         if label == REPEAT_LABEL:
-            if self.last_letter != REPEAT_LABEL:
-                self.repeat_last_letter()
-                self.last_letter = REPEAT_LABEL
-            return None
-        if label != self.last_letter:
-            self.letters.append(label)
-            self.last_letter = label
-        return None
+            return self.repeat_last_letter()
+        self.letters.append(label)
+        return True
 
     def repeat_last_letter(self):
         if not self.letters or self.letters[-1] == REPEAT_LABEL:
@@ -124,14 +83,10 @@ class LetterWordBuffer:
         return self.last_finalized
 
     def finish(self):
-        finalized = self._finish_word("!")
-        self.last_letter = None
-        return finalized
+        return self._finish_word("!")
 
     def finish_word(self):
-        finalized = self._finish_word("")
-        self.last_letter = None
-        return finalized
+        return self._finish_word("")
 
     @property
     def output_text(self):
@@ -284,10 +239,8 @@ def process_camera(camera_index=CAMERA_INDEX):
         raise RuntimeError(f"Could not open camera {camera_index}.")
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    smoother = PredictionSmoother()
     word_buffer = LetterWordBuffer()
-    previous_group_mask = None
-    previous_marker_signal = None
+    current_label = None
     consecutive_read_failures = 0
     try:
         while True:
@@ -317,21 +270,8 @@ def process_camera(camera_index=CAMERA_INDEX):
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            if (
-                previous_group_mask is not None
-                and group_mask != previous_group_mask
-            ) or (
-                previous_marker_signal is not None
-                and marker_signal != previous_marker_signal
-            ):
-                smoother.reset()
-                word_buffer.accept(None)
-            previous_group_mask = group_mask
-            previous_marker_signal = marker_signal
-
             if observable_part_count(group_mask) < MIN_CLASSIFICATION_PARTS:
-                smoother.reset()
-                word_buffer.accept(None)
+                current_label = None
                 text = "Unknown: insufficient visible pose"
                 colour = (0, 0, 255)
             elif not _has_model_for_observation(
@@ -340,8 +280,7 @@ def process_camera(camera_index=CAMERA_INDEX):
                 led_states,
                 marker_signal,
             ):
-                smoother.reset()
-                word_buffer.accept(None)
+                current_label = None
                 text = "Unknown: visibility pattern not trained"
                 colour = (0, 0, 255)
             else:
@@ -352,12 +291,7 @@ def process_camera(camera_index=CAMERA_INDEX):
                     led_states,
                     marker_signal,
                 )
-                stable_label = smoother.update(
-                    label
-                )
-                finalized_word = word_buffer.accept(stable_label)
-                if finalized_word is not None:
-                    print(f"Word: {finalized_word}")
+                current_label = label
                 text = (
                     f"{label} ({confidence:.0%})"
                     if confidence > MIN_CONFIDENCE
@@ -376,7 +310,7 @@ def process_camera(camera_index=CAMERA_INDEX):
             )
             cv2.putText(
                 frame,
-                f"Classes {','.join(classes)} | SPACE pose/Enter: new word | !: end message | Esc: quit",
+                f"Classes {','.join(classes)} | #: record prediction | Enter: new word | !: end message | Esc: quit",
                 (15, 75),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -423,6 +357,13 @@ def process_camera(camera_index=CAMERA_INDEX):
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
                 break
+            if key in (ord("#"), ord("3")):
+                if current_label is None:
+                    print("No letter prediction available to record.")
+                elif not word_buffer.record(current_label):
+                    print(f"Cannot record {current_label} as a letter.")
+                else:
+                    print(f"Recorded: {current_label}")
             if key in (10, 13):
                 finalized = word_buffer.finish_word()
                 if finalized is not None:
