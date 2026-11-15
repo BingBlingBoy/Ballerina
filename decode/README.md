@@ -20,6 +20,11 @@ Use 40 mm square markers, mounted rigidly and with consistent printed-face
 orientation. Collect samples with the marker visibility patterns you expect in
 operation. Complete-visibility samples are useful as a baseline, but are not
 required to train a supported partial-visibility model.
+Mount the red and blue LEDs at distinct, visible positions on the robot head.
+Switch each LED on/off to provide two binary features alongside the pose.
+Before recording, calibrate the LED locations relative to the head marker as
+described below. The LEDs must be on the same flat surface as that marker. The
+software reads LED states but does not control the hardware.
 For a cardboard prototype, use a stationary base, a torso that rotates relative
 to it, and independently movable head and arms. The camera must see all markers
 for complete captures. Live decoding and collection can use partial
@@ -43,7 +48,25 @@ Run commands from the `decode` directory.
    recommended. Use the same camera, resolution, focus, and aspect ratio when
    collecting and running.
 
-2. Arrange the mock robot/markers and start recording:
+2. Calibrate the LED locations, then start recording:
+
+   ```powershell
+   python robot_vision\calibrate_leds.py
+   ```
+
+   Keep head marker ID 0 visible. Turn both LEDs on, click the center of the red
+   LED followed by the blue LED, then collect camera-specific reference samples:
+   turn both LEDs off and press **O**, turn only red on and press **R**, turn
+   only blue on and press **B**, then turn both on and press **A**. Keep the
+   robot still during each 20-frame capture. The calibration learns each LED's
+   appearance on this camera, including both individual and simultaneous
+   operation, instead of relying on fixed hue thresholds. Press **Enter** to
+   save, **X** to redo all steps, or **Esc** to cancel. The saved calibration
+   tracks the sample regions as the head marker moves and tilts. Repeat
+   calibration if either LED, camera, or head marker is moved, or if camera
+   exposure/white balance changes substantially.
+
+   Start the collector:
 
    ```powershell
    python robot_vision\collect_robot_data.py
@@ -53,7 +76,11 @@ Run commands from the `decode` directory.
    including `Q`; **Esc** exits. Each label capture records up to 20 samples at
    approximately 10 Hz when at least two body parts are observable. The CSV
    stores valid marker IDs and an explicit observed-feature mask for every row;
-   unavailable feature values are left blank, never replaced with zero.
+   unavailable pose feature values are left blank, never replaced with zero.
+   It also stores red and blue LED states when the calibrated head-marker
+   regions are available. Confirm that both on-screen states change as you
+   switch each light. If the head marker is missing, too small, or uncalibrated,
+   LED status is **UNKNOWN** and the sample is retained as pose-only data.
 
    For every letter, record captures under each visibility pattern you want the
    decoder to support, across multiple collector runs. Complete-visibility
@@ -100,9 +127,9 @@ Run commands from the `decode` directory.
    At least one visibility pattern must have enough examples for every selected
    label; complete visibility is not required. The dataset is written to
    `robot_vision\robot_pose_letter_dataset.csv`; it is
-   separate from any pre-existing joint-state dataset. A dataset from the
-   previous schema must be moved aside or recollected; the collector will not
-   overwrite it.
+   separate from any pre-existing joint-state dataset. Older pose datasets are
+   migrated by adding blank/invalid LED fields; their existing marker and pose
+   data remains available for pose-only classifiers.
 
 4. Run live whole-body pose inference:
 
@@ -137,10 +164,16 @@ Pose estimates with duplicate marker IDs, failed solves, or excessive
 reprojection error are rejected. Camera calibration is stored locally and
 ignored by Git.
 
-The model bundle contains calibrated RBF SVMs for the supported feature
-combinations. Inference selects one model per frame; image-based ArUco
-detection remains the dominant CPU cost. Confidence combines the selected
-model's calibrated
+The model bundle contains calibrated RBF SVMs for supported pose-feature
+combinations, with LED-aware and pose-only variants when data supports them.
+Inference prefers an LED-aware model when trained and otherwise falls back to
+pose-only. Only rows recorded by the calibrated head-marker ROI detector are
+used to train LED-aware models; older LED readings remain available in the CSV
+but are ignored for LED training. An unlit LED and an occluded or undetected
+LED still look alike within its expected region, so keep the LEDs unobstructed
+while recording and running. Inference selects one model per frame; image-based
+ArUco detection remains the dominant CPU cost.
+Confidence combines the selected model's calibrated
 probability with a conservative feature-coverage factor; it does not replace
 validation against occlusion and image-quality conditions. Measure frame rate
 and latency on the target machine, and validate classifications before using

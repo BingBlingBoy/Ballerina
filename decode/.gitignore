@@ -4,5 +4,6 @@ runs
 labels.cache
 models
 robot_vision/camera_calibration.npz
+robot_vision/led_marker_offsets.json
 __pycache__/
 *.py[cod]
